@@ -334,7 +334,11 @@ def liquid_step_$ID$():\n\
     if using_apic_s$ID$:\n\
         apicMapMACGridToParts(partVel=pVel_pp$ID$, cpx=pCx_pp$ID$, cpy=pCy_pp$ID$, cpz=pCz_pp$ID$, parts=pp_s$ID$, vel=vel_s$ID$, flags=flags_s$ID$)\n\
     else:\n\
-        flipVelocityUpdate(vel=vel_s$ID$, velOld=velOld_s$ID$, flags=flags_s$ID$, parts=pp_s$ID$, partVel=pVel_pp$ID$, flipRatio=flipRatio_s$ID$)\n";
+        flipVelocityUpdate(vel=vel_s$ID$, velOld=velOld_s$ID$, flags=flags_s$ID$, parts=pp_s$ID$, partVel=pVel_pp$ID$, flipRatio=flipRatio_s$ID$)\n\
+    \n\
+    # Apply per-object stickiness / friction from collision objects to particle velocities\n\
+    if using_obstacle_s$ID$:\n\
+        applyObstacleStickiness(parts=pp_s$ID$, pvel=pVel_pp$ID$, flags=flags_s$ID$, phiObs=phiObs_s$ID$, obvel=obvel_s$ID$, stickGuide=stickiness_s$ID$, fricGuide=friction_s$ID$, band=2.5)\n";
 
 const std::string liquid_step_mesh =
     "\n\

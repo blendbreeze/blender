@@ -866,6 +866,10 @@ struct FluidEffectorSettings {
   eFluidEffector_Type type = FLUID_EFFECTOR_TYPE_COLLISION;
   char _pad1[6] = {};
 
+  /* Collision options. */
+  float stickiness = 0.0f; /* Amount of adhesion keeping liquid at this obstacle's surface. */
+  float friction = 0.0f;   /* Amount of tangential velocity damping at this obstacle's surface. */
+
   /* Guiding options. */
   float vel_multi = 1.0f; /* Multiplier for object velocity. */
   eFluidEffector_GuideMode guide_mode = FLUID_EFFECTOR_GUIDE_OVERRIDE;

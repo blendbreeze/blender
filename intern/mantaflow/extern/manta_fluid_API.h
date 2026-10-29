@@ -82,6 +82,8 @@ float *manta_get_force_z(struct MANTA *fluid);
 float *manta_get_phiguide_in(struct MANTA *fluid);
 float *manta_get_num_obstacle(struct MANTA *fluid);
 float *manta_get_num_guide(struct MANTA *fluid);
+float *manta_get_stickiness_guide(struct MANTA *fluid);
+float *manta_get_friction_guide(struct MANTA *fluid);
 int manta_get_res_x(struct MANTA *fluid);
 int manta_get_res_y(struct MANTA *fluid);
 int manta_get_res_z(struct MANTA *fluid);

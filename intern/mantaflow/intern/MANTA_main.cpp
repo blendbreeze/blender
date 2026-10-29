@@ -2234,6 +2234,11 @@ void MANTA::updatePointers(FluidModifierData *fmd, bool flush)
   mObVelocityY = (obstacle) ? getPointer<float>("y_obvel" + s_ext, func) : nullptr;
   mObVelocityZ = (obstacle) ? getPointer<float>("z_obvel" + s_ext, func) : nullptr;
   mNumObstacle = (obstacle) ? getPointer<float>("numObs" + s_ext, func) : nullptr;
+  mStickinessGuide = (obstacle && liquid) ?
+                         getPointer<float>("stickiness" + s_ext, func) :
+                         nullptr;
+  mFrictionGuide = (obstacle && liquid) ? getPointer<float>("friction" + s_ext, func) :
+                                          nullptr;
 
   /* Guiding. */
   mPhiGuideIn = (guiding) ? getPointer<float>("phiGuideIn" + s_ext, func) : nullptr;

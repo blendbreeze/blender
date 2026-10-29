@@ -280,6 +280,9 @@ class PHYSICS_PT_settings(PhysicButtonsPanel, Panel):
             col = grid.column()
             col.prop(effector_settings, "subframes", text="Sampling Substeps")
             col.prop(effector_settings, "surface_distance", text="Surface Thickness")
+            if effector_settings.effector_type == 'COLLISION':
+                col.prop(effector_settings, "friction", text="Friction")
+                col.prop(effector_settings, "stickiness", text="Stickiness")
 
             col = grid.column()
 

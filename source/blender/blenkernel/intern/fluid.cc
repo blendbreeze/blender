@@ -827,7 +827,7 @@ static void bb_combineMaps(FluidObjectBB *output,
 /** \name Effectors
  * \{ */
 
-BLI_INLINE void apply_effector_fields(FluidEffectorSettings * /*fes*/,
+BLI_INLINE void apply_effector_fields(FluidEffectorSettings *fes,
                                       int index,
                                       float src_distance_value,
                                       float *dest_phi_in,
@@ -836,7 +836,9 @@ BLI_INLINE void apply_effector_fields(FluidEffectorSettings * /*fes*/,
                                       float const src_vel_value[3],
                                       float *dest_vel_x,
                                       float *dest_vel_y,
-                                      float *dest_vel_z)
+                                      float *dest_vel_z,
+                                      float *dest_stickiness,
+                                      float *dest_friction)
 {
   /* Ensure that distance value is "joined" into the levelset. */
   if (dest_phi_in) {
@@ -853,6 +855,16 @@ BLI_INLINE void apply_effector_fields(FluidEffectorSettings * /*fes*/,
     dest_vel_x[index] += src_vel_value[0];
     dest_vel_y[index] += src_vel_value[1];
     dest_vel_z[index] += src_vel_value[2];
+  }
+
+  /* Accumulate per-object stickiness / friction near the obstacle surface (max blend). */
+  if (fes->type == FLUID_EFFECTOR_TYPE_COLLISION && src_distance_value < 3.0f) {
+    if (dest_stickiness) {
+      dest_stickiness[index] = std::max(fes->stickiness, dest_stickiness[index]);
+    }
+    if (dest_friction) {
+      dest_friction[index] = std::max(fes->friction, dest_friction[index]);
+    }
   }
 }
 
@@ -1342,6 +1354,11 @@ static void update_obstacles(Depsgraph *depsgraph,
   float *phi_guide_in = manta_get_phiguide_in(fds->fluid);
   float *num_obstacles = manta_get_num_obstacle(fds->fluid);
   float *num_guides = manta_get_num_guide(fds->fluid);
+  /* Stickiness / friction guides are max-blended over time (no per-frame reset) so that
+   * static collision objects keep their values. The solver only applies them where the
+   * (per frame rebuilt) obstacle levelset is within its band. */
+  float *stickiness_guide = manta_get_stickiness_guide(fds->fluid);
+  float *friction_guide = manta_get_friction_guide(fds->fluid);
   uint z;
 
   bool use_adaptivedomain = (fds->flags & FLUID_DOMAIN_USE_ADAPTIVE_DOMAIN);
@@ -1446,7 +1463,9 @@ static void update_obstacles(Depsgraph *depsgraph,
                                     &velocity_map[e_index * 3],
                                     vel_x,
                                     vel_y,
-                                    vel_z);
+                                    vel_z,
+                                    stickiness_guide,
+                                    friction_guide);
             }
             if (fes->type == FLUID_EFFECTOR_TYPE_GUIDE) {
               apply_effector_fields(fes,
@@ -1458,7 +1477,9 @@ static void update_obstacles(Depsgraph *depsgraph,
                                     &velocity_map[e_index * 3],
                                     vel_x_guide,
                                     vel_y_guide,
-                                    vel_z_guide);
+                                    vel_z_guide,
+                                    nullptr,
+                                    nullptr);
             }
           }
         }
@@ -5087,6 +5108,10 @@ void BKE_fluid_modifier_copy(const FluidModifierData *fmd, FluidModifierData *tf
     tfes->type = fes->type;
     tfes->flags = fes->flags;
     tfes->subframes = fes->subframes;
+
+    /* collision options */
+    tfes->stickiness = fes->stickiness;
+    tfes->friction = fes->friction;
 
     /* guide options */
     tfes->guide_mode = fes->guide_mode;

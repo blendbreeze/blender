@@ -248,6 +248,14 @@ struct MANTA {
   {
     return mNumObstacle;
   }
+  float *getStickinessGuide()
+  {
+    return mStickinessGuide;
+  }
+  float *getFrictionGuide()
+  {
+    return mFrictionGuide;
+  }
   float *getNumGuide()
   {
     return mNumGuide;
@@ -796,6 +804,8 @@ struct MANTA {
   float *mForceZ = nullptr;
   int *mFlags = nullptr;
   float *mNumObstacle = nullptr;
+  float *mStickinessGuide = nullptr;
+  float *mFrictionGuide = nullptr;
   float *mNumGuide = nullptr;
   float *mPressure = nullptr;
 

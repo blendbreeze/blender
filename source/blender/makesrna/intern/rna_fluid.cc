@@ -2995,6 +2995,23 @@ static void rna_def_fluid_effector_settings(BlenderRNA *brna)
       prop, "Surface", "Additional distance around mesh surface to consider as effector");
   RNA_def_property_update(prop, NC_OBJECT | ND_MODIFIER, "rna_Fluid_effector_reset");
 
+  prop = RNA_def_property(srna, "friction", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_range(prop, 0.0, 1.0);
+  RNA_def_property_ui_range(prop, 0.0, 1.0, 0.05, 2);
+  RNA_def_property_ui_text(prop,
+                           "Friction",
+                           "Amount of tangential velocity damping for liquid in contact with "
+                           "this obstacle");
+  RNA_def_property_update(prop, NC_OBJECT | ND_MODIFIER, "rna_Fluid_effector_reset");
+
+  prop = RNA_def_property(srna, "stickiness", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_range(prop, 0.0, 1.0);
+  RNA_def_property_ui_range(prop, 0.0, 1.0, 0.05, 2);
+  RNA_def_property_ui_text(prop,
+                           "Stickiness",
+                           "Amount of adhesion keeping liquid in contact with this obstacle");
+  RNA_def_property_update(prop, NC_OBJECT | ND_MODIFIER, "rna_Fluid_effector_reset");
+
   prop = RNA_def_property(srna, "use_plane_init", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "flags", FLUID_EFFECTOR_USE_PLANE_INIT);
   RNA_def_property_ui_text(prop, "Is Planar", "Treat this object as a planar, unclosed mesh");

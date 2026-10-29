@@ -75,6 +75,7 @@ extern void PbRegister_unionParticleLevelset();
 extern void PbRegister_averagedParticleLevelset();
 extern void PbRegister_improvedParticleLevelset();
 extern void PbRegister_pushOutofObs();
+extern void PbRegister_applyObstacleStickiness();
 extern void PbRegister_mapPartsToMAC();
 extern void PbRegister_mapPartsToGrid();
 extern void PbRegister_mapPartsToGridVec3();
@@ -273,6 +274,7 @@ void MantaEnsureRegistration()
   PbRegister_averagedParticleLevelset();
   PbRegister_improvedParticleLevelset();
   PbRegister_pushOutofObs();
+  PbRegister_applyObstacleStickiness();
   PbRegister_mapPartsToMAC();
   PbRegister_mapPartsToGrid();
   PbRegister_mapPartsToGridVec3();

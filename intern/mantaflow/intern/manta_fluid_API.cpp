@@ -250,6 +250,14 @@ float *manta_get_num_guide(MANTA *fluid)
 {
   return fluid->getNumGuide();
 }
+float *manta_get_stickiness_guide(MANTA *fluid)
+{
+  return fluid->getStickinessGuide();
+}
+float *manta_get_friction_guide(MANTA *fluid)
+{
+  return fluid->getFrictionGuide();
+}
 
 int manta_get_res_x(MANTA *fluid)
 {

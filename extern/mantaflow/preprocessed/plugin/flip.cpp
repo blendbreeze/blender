@@ -1751,6 +1751,197 @@ void PbRegister_pushOutofObs()
 }
 
 //******************************************************************************
+// obstacle stickiness / friction
+
+struct knApplyObstacleStickiness : public KernelBase {
+  knApplyObstacleStickiness(BasicParticleSystem &parts,
+                            ParticleDataImpl<Vec3> &pvel,
+                            const FlagGrid &flags,
+                            const Grid<Real> &phiObs,
+                            const MACGrid &obvel,
+                            const Grid<Real> &stickGuide,
+                            const Grid<Real> &fricGuide,
+                            const Real band)
+      : KernelBase(parts.size()),
+        parts(parts),
+        pvel(pvel),
+        flags(flags),
+        phiObs(phiObs),
+        obvel(obvel),
+        stickGuide(stickGuide),
+        fricGuide(fricGuide),
+        band(band)
+  {
+    runMessage();
+    run();
+  }
+  inline void op(IndexInt idx,
+                 BasicParticleSystem &parts,
+                 ParticleDataImpl<Vec3> &pvel,
+                 const FlagGrid &flags,
+                 const Grid<Real> &phiObs,
+                 const MACGrid &obvel,
+                 const Grid<Real> &stickGuide,
+                 const Grid<Real> &fricGuide,
+                 const Real band) const
+  {
+    if (!parts.isActive(idx))
+      return;
+    const Vec3 pos = parts.getPos(idx);
+    const Vec3i p = toVec3iFloor(pos);
+    if (!flags.isInBounds(p))
+      return;
+
+    // Per-object stickiness / friction values (0 if not near a sticky obstacle)
+    const Real s = stickGuide.getInterpolated(pos);
+    const Real f = fricGuide.getInterpolated(pos);
+    if (s <= VECTOR_EPSILON && f <= VECTOR_EPSILON)
+      return;
+
+    // phiObs is positive on the fluid side of the obstacle surface
+    const Real phi = phiObs.getInterpolated(pos);
+    if (phi >= band)
+      return;
+
+    Real w = 1.0 - phi / band;
+    w = (w < 0.) ? 0. : ((w > 1.) ? 1. : w);
+
+    // Surface normal, points away from the obstacle
+    Vec3 n = getGradient(phiObs, p.x, p.y, p.z);
+    if (normalize(n) < VECTOR_EPSILON)
+      return;
+
+    // Velocity relative to the (possibly moving) obstacle
+    const Vec3 ov = obvel.getInterpolated(pos);
+    const Vec3 rel = pvel[idx] - ov;
+    Real vn = dot(rel, n);   // separating velocity component
+    Vec3 vt = rel - n * vn;  // tangential slip
+
+    // Friction dampens tangential slip, stickiness dampens separation from the surface
+    vt *= 1.0 - f * w;
+    vn *= 1.0 - s * w;
+    pvel[idx] = ov + vt + n * vn;
+  }
+  inline BasicParticleSystem &getArg0()
+  {
+    return parts;
+  }
+  typedef BasicParticleSystem type0;
+  inline ParticleDataImpl<Vec3> &getArg1()
+  {
+    return pvel;
+  }
+  typedef ParticleDataImpl<Vec3> type1;
+  inline const FlagGrid &getArg2()
+  {
+    return flags;
+  }
+  typedef FlagGrid type2;
+  inline const Grid<Real> &getArg3()
+  {
+    return phiObs;
+  }
+  typedef Grid<Real> type3;
+  inline const MACGrid &getArg4()
+  {
+    return obvel;
+  }
+  typedef MACGrid type4;
+  inline const Grid<Real> &getArg5()
+  {
+    return stickGuide;
+  }
+  typedef Grid<Real> type5;
+  inline const Grid<Real> &getArg6()
+  {
+    return fricGuide;
+  }
+  typedef Grid<Real> type6;
+  inline const Real &getArg7()
+  {
+    return band;
+  }
+  typedef Real type7;
+  void runMessage()
+  {
+    debMsg("Executing kernel knApplyObstacleStickiness ", 3);
+    debMsg("Kernel range"
+               << " size " << size << " ",
+           4);
+  };
+  void operator()(const tbb::blocked_range<IndexInt> &__r) const
+  {
+    for (IndexInt idx = __r.begin(); idx != (IndexInt)__r.end(); idx++)
+      op(idx, parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, band);
+  }
+  void run()
+  {
+    tbb::parallel_for(tbb::blocked_range<IndexInt>(0, size), *this);
+  }
+  BasicParticleSystem &parts;
+  ParticleDataImpl<Vec3> &pvel;
+  const FlagGrid &flags;
+  const Grid<Real> &phiObs;
+  const MACGrid &obvel;
+  const Grid<Real> &stickGuide;
+  const Grid<Real> &fricGuide;
+  const Real band;
+};
+//! Apply per-object friction and stickiness to particles close to obstacle
+//! surfaces. stickGuide / fricGuide store per-cell object values (max blend
+//! for overlapping obstacles), band is the distance in cells within which
+//! particles are affected.
+
+void applyObstacleStickiness(BasicParticleSystem &parts,
+                             ParticleDataImpl<Vec3> &pvel,
+                             const FlagGrid &flags,
+                             const Grid<Real> &phiObs,
+                             const MACGrid &obvel,
+                             const Grid<Real> &stickGuide,
+                             const Grid<Real> &fricGuide,
+                             const Real band = 2.5)
+{
+  knApplyObstacleStickiness(parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, band);
+}
+static PyObject *_W_22(PyObject *_self, PyObject *_linargs, PyObject *_kwds)
+{
+  try {
+    PbArgs _args(_linargs, _kwds);
+    FluidSolver *parent = _args.obtainParent();
+    bool noTiming = _args.getOpt<bool>("notiming", -1, 0);
+    pbPreparePlugin(parent, "applyObstacleStickiness", !noTiming);
+    PyObject *_retval = nullptr;
+    {
+      ArgLocker _lock;
+      BasicParticleSystem &parts = *_args.getPtr<BasicParticleSystem>("parts", 0, &_lock);
+      ParticleDataImpl<Vec3> &pvel = *_args.getPtr<ParticleDataImpl<Vec3>>("pvel", 1, &_lock);
+      const FlagGrid &flags = *_args.getPtr<FlagGrid>("flags", 2, &_lock);
+      const Grid<Real> &phiObs = *_args.getPtr<Grid<Real>>("phiObs", 3, &_lock);
+      const MACGrid &obvel = *_args.getPtr<MACGrid>("obvel", 4, &_lock);
+      const Grid<Real> &stickGuide = *_args.getPtr<Grid<Real>>("stickGuide", 5, &_lock);
+      const Grid<Real> &fricGuide = *_args.getPtr<Grid<Real>>("fricGuide", 6, &_lock);
+      const Real band = _args.getOpt<Real>("band", 7, 2.5, &_lock);
+      _retval = getPyNone();
+      applyObstacleStickiness(parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, band);
+      _args.check();
+    }
+    pbFinalizePlugin(parent, "applyObstacleStickiness", !noTiming);
+    return _retval;
+  }
+  catch (std::exception &e) {
+    pbSetError("applyObstacleStickiness", e.what());
+    return 0;
+  }
+}
+static const Pb::Register _RP_applyObstacleStickiness("", "applyObstacleStickiness", _W_22);
+extern "C" {
+void PbRegister_applyObstacleStickiness()
+{
+  KEEP_UNUSED(_RP_applyObstacleStickiness);
+}
+}
+
+//******************************************************************************
 // grid interpolation functions
 
 template<class T> struct knSafeDivReal : public KernelBase {
