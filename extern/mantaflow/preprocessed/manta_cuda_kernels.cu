@@ -3,10 +3,13 @@
 // levelset extrapolation, MAC velocity extrapolation). Ported 1:1 from the
 // CPU kernels in levelset.cpp / fastmarch.cpp - see PROJECT_NOTES.md.
 //
-// Enabled at runtime via MANTA_CUDA=1. Data is staged with cudaMemcpy per
-// call (grids are flat contiguous arrays). All kernels are deterministic:
+// Enabled at runtime via MANTA_CUDA=1. All data is staged with cudaMemcpy per
+// call (grids are flat contiguous arrays). The kernels are deterministic:
 // flood fill is order independent, the extrapolation passes only write cells
 // whose values are never read within the same pass.
+//
+// After the first CUDA error the path latches off for the session with a
+// single log line and all callers fall back to the CPU implementations.
 
 #include <climits>
 #include <cstdio>
@@ -19,86 +22,116 @@
 namespace Manta {
 namespace manta_cuda {
 
-static bool enabledCached()
+// Latched off after the first CUDA error so one failure cannot spam the log
+// or poison further calls; the sim silently continues on CPU.
+static bool s_latched = false;
+
+static bool initEnvDevice()
 {
-  static int mode = -1;
-  if (mode < 0) {
-    mode = 0;
-    const char *env = getenv("MANTA_CUDA");
-    if (env && atoi(env)) {
-      int count = 0;
-      cudaError_t e1 = cudaGetDeviceCount(&count);
-      cudaError_t e2 = (e1 == cudaSuccess && count > 0) ? cudaSetDevice(0) : cudaErrorUnknown;
-      cudaError_t e3 = (e2 == cudaSuccess) ? cudaFree(0) : cudaErrorUnknown;
-      if (e1 == cudaSuccess && count > 0 && e2 == cudaSuccess && e3 == cudaSuccess) {
-        mode = 1;
-      }
-      else {
-        fprintf(stderr,
-                "MANTA_CUDA: disabled (count=%d e1=%d e2=%d e3=%d: %s)\n",
-                count,
-                (int)e1,
-                (int)e2,
-                (int)e3,
-                cudaGetErrorString(e1 != cudaSuccess ? e1 : (e2 != cudaSuccess ? e2 : e3)));
-      }
-    }
+  const char *env = getenv("MANTA_CUDA");
+  if (!env || !atoi(env)) {
+    return false;
   }
-  return mode == 1;
+  int count = 0;
+  cudaError_t e1 = cudaGetDeviceCount(&count);
+  if (e1 != cudaSuccess || count <= 0) {
+    fprintf(stderr,
+            "MANTA_CUDA: no usable CUDA device (%s), staying on CPU\n",
+            cudaGetErrorString(e1));
+    return false;
+  }
+  cudaError_t e2 = cudaSetDevice(0);
+  cudaError_t e3 = (e2 == cudaSuccess) ? cudaFree(0) : cudaErrorUnknown;
+  if (e2 != cudaSuccess || e3 != cudaSuccess) {
+    fprintf(stderr,
+            "MANTA_CUDA: device init failed (%s), staying on CPU\n",
+            cudaGetErrorString(e2 != cudaSuccess ? e2 : e3));
+    return false;
+  }
+  fprintf(stderr, "MANTA_CUDA: enabled\n");
+  return true;
+}
+
+static void cudaFail(const char *where, cudaError_t rc)
+{
+  if (!s_latched) {
+    s_latched = true;
+    fprintf(stderr,
+            "MANTA_CUDA: error in %s: %s - CUDA disabled for this session "
+            "(continuing on CPU)\n",
+            where,
+            cudaGetErrorString(rc));
+  }
 }
 
 bool enabled()
 {
-  return enabledCached();
+  static bool s_env = initEnvDevice();
+  return s_env && !s_latched;
 }
 
-#define CUDA_CHECK(expr) ((cudaGetLastError() == cudaSuccess && (expr) == cudaSuccess))
+// Run a CUDA call, latch off and bail out on error. The reported error is
+// the actual return code of this call (sticky async kernel errors surface
+// here at the next synchronizing call).
+#define CUDA_SYNC_CHECK(call, where) \
+  do { \
+    cudaError_t _rc = (call); \
+    if (_rc != cudaSuccess) { \
+      cudaFail(where, _rc); \
+      return false; \
+    } \
+  } while (0)
 
-// Persistent device buffer cache (grows to the largest grid seen, never
-// shrinks). Plugin calls happen from the single Python solver thread, so no
-// locking is needed. This avoids cudaMalloc/cudaFree per call, which costs
-// more than the kernels themselves on small grids.
+// Persistent device buffers (grow to the largest request, never shrink).
+// Plugin calls are serialized by the Python GIL (verified: no
+// Py_BEGIN_ALLOW_THREADS in the mantaflow wrapper layer), so no locking.
+// NOTE: `phi` is sized in floats and holds a scalar grid (n) or a MAC grid
+// (3 floats per cell) depending on the operation.
 struct DevBuffers {
-  float *phi = nullptr;   // levelset / MAC component scratch
-  int *ibuf = nullptr;    // visited / tmp
+  float *phi = nullptr;
+  int *ibuf = nullptr;
+  int *flagsBuf = nullptr;
   int *front[2] = {nullptr, nullptr};
   int *fcount = nullptr;
-  long cap = 0;
+  long phiFloats = 0;
+  long intCells = 0;
 
-  bool ensure(long cells)
+  bool ensure(long needFloats, long needInts)
   {
-    if (cells <= cap) {
+    if (needFloats <= phiFloats && needInts <= intCells) {
       return true;
     }
-    free();
-    long n = (cap > 0) ? cap : cells;
-    while (n < cells) {
-      n *= 2;
-    }
-    bool ok = cudaMalloc(&phi, n * sizeof(float)) == cudaSuccess;
-    ok = ok && cudaMalloc(&ibuf, n * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&front[0], n * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&front[1], n * sizeof(int)) == cudaSuccess;
+    freeAll();
+    bool ok = cudaMalloc(&phi, needFloats * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&ibuf, needInts * sizeof(int)) == cudaSuccess;
+    ok = ok && cudaMalloc(&flagsBuf, needInts * sizeof(int)) == cudaSuccess;
+    ok = ok && cudaMalloc(&front[0], needInts * sizeof(int)) == cudaSuccess;
+    ok = ok && cudaMalloc(&front[1], needInts * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&fcount, sizeof(int)) == cudaSuccess;
     if (!ok) {
-      free();
+      cudaFail("device buffer alloc", cudaGetLastError());
+      freeAll();
       return false;
     }
-    cap = n;
+    phiFloats = needFloats;
+    intCells = needInts;
     return true;
   }
-  void free()
+  void freeAll()
   {
     cudaFree(phi);
     cudaFree(ibuf);
+    cudaFree(flagsBuf);
     cudaFree(front[0]);
     cudaFree(front[1]);
     cudaFree(fcount);
     phi = nullptr;
     ibuf = nullptr;
+    flagsBuf = nullptr;
     front[0] = front[1] = nullptr;
     fcount = nullptr;
-    cap = 0;
+    phiFloats = 0;
+    intCells = 0;
   }
 };
 
@@ -356,6 +389,9 @@ __global__ void macMark(const int *__restrict__ flags,
   long axisOff = (axis == 0) ? 1 : (axis == 1) ? sx : strideZ;
   for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
        t += (long)gridDim.x * blockDim.x) {
+    if (t < axisOff) {
+      continue;
+    }
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
     if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
@@ -421,50 +457,29 @@ static int blocksFor(long n)
   return (int)((n + 255) / 256);
 }
 
-// TEMP debug: trace first CUDA-path decisions
-static int g_dbgCount = 0;
-#define MDBG(...) \
-  do { \
-    if (g_dbgCount < 20) { \
-      fprintf(stderr, "MANTA_CUDA: " __VA_ARGS__); \
-      g_dbgCount++; \
-    } \
-  } while (0)
-
 }  // namespace manta_cuda
 
 bool cudaFloodFill(Grid<Real> &phi, Real value, bool outside, int boundaryWidth)
 {
   using namespace manta_cuda;
   if (!enabled()) {
-    MDBG("floodFill: not enabled\n");
     return false;
   }
   const int sx = phi.getSizeX(), sy = phi.getSizeY(), sz = phi.getSizeZ();
   const long n = (long)sx * sy * sz;
   const long strideZ = (long)sx * sy;
   if (n <= 0 || n >= (long)INT_MAX) {
-    MDBG("floodFill: size out of range (%ld)\n", n);
-    return false;
-  }
-  if (sizeof(Vec3) != 3 * sizeof(Real)) {
-    MDBG("floodFill: vec layout mismatch\n");
     return false;
   }
 
-  if (!g_dev.ensure(n)) {
-    MDBG("floodFill: buffer alloc failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+  if (!g_dev.ensure(n, n)) {
     return false;
   }
   DevBuffers &buf = g_dev;
-  bool ok = CUDA_CHECK(cudaMemcpy(buf.phi, &phi(0), n * sizeof(float), cudaMemcpyHostToDevice));
-  ok = ok && CUDA_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)));
-  ok = ok && CUDA_CHECK(cudaMemset(buf.fcount, 0, sizeof(int)));
-  if (!ok) {
-    MDBG("floodFill: initial transfer failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-    return false;
-  }
-  MDBG("floodFill: entering GPU path n=%ld\n", n);
+  CUDA_SYNC_CHECK(cudaMemcpy(buf.phi, &phi(0), n * sizeof(float), cudaMemcpyHostToDevice),
+                  "floodFill: copy in");
+  CUDA_SYNC_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)), "floodFill: memset visited");
+  CUDA_SYNC_CHECK(cudaMemset(buf.fcount, 0, sizeof(int)), "floodFill: memset count");
 
   seedWalls<<<blocksFor(n), 256>>>(
       buf.phi, buf.ibuf, buf.front[0], buf.fcount, sx, sy, sz, strideZ, boundaryWidth, outside);
@@ -473,10 +488,8 @@ bool cudaFloodFill(Grid<Real> &phi, Real value, bool outside, int boundaryWidth)
   int cur = 0;
   for (long iter = 0; iter < n + 8; iter++) {
     int hCount = 0;
-    if (cudaMemcpy(&hCount, buf.fcount, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
-      MDBG("floodFill: counter readback failed\n");
-      return false;
-    }
+    CUDA_SYNC_CHECK(cudaMemcpy(&hCount, buf.fcount, sizeof(int), cudaMemcpyDeviceToHost),
+                    "floodFill: count readback");
     if (hCount == 0) {
       break;
     }
@@ -500,17 +513,13 @@ bool cudaFloodFill(Grid<Real> &phi, Real value, bool outside, int boundaryWidth)
     cur ^= 1;
   }
   if (exhausted) {
-    MDBG("floodFill: BFS exhausted (bug)\n");
+    cudaFail("floodFill: BFS exhausted (bug)", cudaErrorUnknown);
     return false;
   }
 
   applyFill<<<blocksFor(n), 256>>>(buf.phi, buf.ibuf, n, (float)value, outside);
-  ok = CUDA_CHECK(cudaMemcpy(&phi(0), buf.phi, n * sizeof(float), cudaMemcpyDeviceToHost));
-  if (!ok) {
-    MDBG("floodFill: final readback failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-    return false;
-  }
-  MDBG("floodFill: GPU path ok\n");
+  CUDA_SYNC_CHECK(cudaMemcpy(&phi(0), buf.phi, n * sizeof(float), cudaMemcpyDeviceToHost),
+                  "floodFill: copy out");
   return true;
 }
 
@@ -528,15 +537,13 @@ bool cudaExtrapolateLsSimple(Grid<Real> &phi, int distance, bool inside)
     return false;
   }
 
-  if (!g_dev.ensure(n)) {
+  if (!g_dev.ensure(n, n)) {
     return false;
   }
   DevBuffers &buf = g_dev;
-  bool ok = CUDA_CHECK(cudaMemcpy(buf.phi, &phi(0), n * sizeof(float), cudaMemcpyHostToDevice));
-  ok = ok && CUDA_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)));
-  if (!ok) {
-    return false;
-  }
+  CUDA_SYNC_CHECK(cudaMemcpy(buf.phi, &phi(0), n * sizeof(float), cudaMemcpyHostToDevice),
+                  "extrapolateLs: copy in");
+  CUDA_SYNC_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)), "extrapolateLs: memset tmp");
 
   const float direction = inside ? -1.0f : 1.0f;
   lsMarkSkip<<<blocksFor(n), 256>>>(buf.phi, buf.ibuf, sx, sy, sz, strideZ, inside);
@@ -547,8 +554,9 @@ bool cudaExtrapolateLsSimple(Grid<Real> &phi, int distance, bool inside)
   lsRemaining<<<blocksFor(n), 256>>>(
       buf.phi, buf.ibuf, sx, sy, sz, strideZ, direction * (distance + 2));
 
-  ok = CUDA_CHECK(cudaMemcpy(&phi(0), buf.phi, n * sizeof(float), cudaMemcpyDeviceToHost));
-  return ok;
+  CUDA_SYNC_CHECK(cudaMemcpy(&phi(0), buf.phi, n * sizeof(float), cudaMemcpyDeviceToHost),
+                  "extrapolateLs: copy out");
+  return true;
 }
 
 bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool intoObs, int dim)
@@ -560,33 +568,42 @@ bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool 
   const int sx = flags.getSizeX(), sy = flags.getSizeY(), sz = flags.getSizeZ();
   const long n = (long)sx * sy * sz;
   const long strideZ = (long)sx * sy;
+  // A MAC grid stores one Vec3 (3 floats) per cell.
   if (n <= 0 || n >= (long)INT_MAX || sizeof(Vec3) != 3 * sizeof(Real)) {
     return false;
   }
-  const long velBytes = 3 * n * sizeof(float);
+  const long velFloats = 3 * n;
 
-  if (!g_dev.ensure(n)) {
+  if (!g_dev.ensure(velFloats, n)) {
     return false;
   }
   DevBuffers &buf = g_dev;
-  bool ok = CUDA_CHECK(cudaMemcpy(buf.phi, &vel(0), velBytes, cudaMemcpyHostToDevice));
-  if (!ok) {
-    return false;
-  }
+  CUDA_SYNC_CHECK(cudaMemcpy(buf.phi, &vel(0), velFloats * sizeof(float), cudaMemcpyHostToDevice),
+                  "extrapolateMAC: copy in");
+  CUDA_SYNC_CHECK(cudaMemcpy(buf.flagsBuf, &flags(0), n * sizeof(int), cudaMemcpyHostToDevice),
+                  "extrapolateMAC: flags copy");
 
   for (int c = 0; c < dim; ++c) {
-    if (!CUDA_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)))) {
+    CUDA_SYNC_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)), "extrapolateMAC: memset tmp");
+    macMark<<<blocksFor(n), 256>>>(buf.flagsBuf, buf.ibuf, sx, sy, sz, strideZ, c, intoObs);
+    cudaError_t lrc = cudaGetLastError();
+    if (lrc != cudaSuccess) {
+      cudaFail("extrapolateMAC: macMark launch", lrc);
       return false;
     }
-    macMark<<<blocksFor(n), 256>>>(
-        (const int *)&flags(0), buf.ibuf, sx, sy, sz, strideZ, c, intoObs);
     for (int d = 1; d < 1 + distance; ++d) {
       macDilate<<<blocksFor(n), 256>>>(buf.phi, buf.ibuf, sx, sy, sz, strideZ, dim, d, c);
+      lrc = cudaGetLastError();
+      if (lrc != cudaSuccess) {
+        cudaFail("extrapolateMAC: macDilate launch", lrc);
+        return false;
+      }
     }
   }
 
-  ok = CUDA_CHECK(cudaMemcpy(&vel(0), buf.phi, velBytes, cudaMemcpyDeviceToHost));
-  return ok;
+  CUDA_SYNC_CHECK(cudaMemcpy(&vel(0), buf.phi, velFloats * sizeof(float), cudaMemcpyDeviceToHost),
+                  "extrapolateMAC: copy out");
+  return true;
 }
 
 }  // namespace Manta
