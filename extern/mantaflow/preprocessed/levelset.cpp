@@ -17,6 +17,7 @@
  ******************************************************************************/
 
 #include "levelset.h"
+#include "manta_cuda.h"
 #include "fastmarch.h"
 #include "kernel.h"
 #include "mcubes.h"
@@ -757,6 +758,11 @@ void LevelsetGrid::floodFill(const Real value, const bool outside, const int bou
   }
   else {
     assertMsg(value >= 0, "Cannot fill inside with (negative) value " << value);
+  }
+
+  /* Optional CUDA path (MANTA_CUDA=1), identical result to the CPU version. */
+  if (manta_cuda::enabled() && cudaFloodFill(*this, value, outside, boundaryWidth)) {
+    return;
   }
 
   Grid<Real> levelsetCopy(this->getParent());

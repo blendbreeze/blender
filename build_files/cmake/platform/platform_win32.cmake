@@ -97,8 +97,7 @@ macro(find_package_wrapper)
 endmacro()
 
 # Needed, otherwise system encoding causes utf-8 encoding to fail in some cases (C4819)
-add_compile_options("$<$<C_COMPILER_ID:MSVC>:/utf-8>")
-add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
 
 # Needed for some MSVC installations, example warning:
 # `4099 : PDB {filename} was not found with {object/library}`.
@@ -377,7 +376,13 @@ unset(MATERIALX_LIB_FOLDER_EXISTS)
 if(NOT MSVC_CLANG                  AND # Available with MSVC 15.7+ but not for CLANG.
    NOT WITH_WINDOWS_SCCACHE        AND # And not when sccache is enabled
    NOT VS_CLANG_TIDY)                  # Clang-tidy does not like these options
-  add_compile_options(/experimental:external /external:I "${LIBDIR}" /external:W0)
+  # MSVC only options - guard against leaking into CUDA compilations (nvcc
+  # cannot parse them and mistakes the path after /external:I for an input).
+  add_compile_options(
+    "$<$<COMPILE_LANGUAGE:C,CXX>:/experimental:external>"
+    "$<$<COMPILE_LANGUAGE:C,CXX>:/external:I;${LIBDIR}>"
+    "$<$<COMPILE_LANGUAGE:C,CXX>:/external:W0>"
+  )
 endif()
 
 # Add each of our libraries to our cmake_prefix_path so find_package() could work

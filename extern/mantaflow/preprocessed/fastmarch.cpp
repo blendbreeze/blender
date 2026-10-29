@@ -17,6 +17,7 @@
  ******************************************************************************/
 
 #include "fastmarch.h"
+#include "manta_cuda.h"
 #include "levelset.h"
 #include "kernel.h"
 #include <algorithm>
@@ -619,10 +620,13 @@ void extrapolateMACSimple(FlagGrid &flags,
                           LevelsetGrid *phiObs = nullptr,
                           bool intoObs = false)
 {
-  Grid<int> tmp(flags.getParent());
   int dim = (flags.is3D() ? 3 : 2);
 
-  for (int c = 0; c < dim; ++c) {
+  /* Optional CUDA path (MANTA_CUDA=1) for all axis passes. */
+  if (!(manta_cuda::enabled() && cudaExtrapolateMACSimple(flags, vel, distance, intoObs, dim))) {
+    Grid<int> tmp(flags.getParent());
+
+    for (int c = 0; c < dim; ++c) {
     Vec3i dir = 0;
     dir[c] = 1;
     tmp.clear();
@@ -650,7 +654,8 @@ void extrapolateMACSimple(FlagGrid &flags,
     for (int d = 1; d < 1 + distance; ++d) {
       knExtrapolateMACSimple(vel, distance, tmp, d, c);
     }  // d
-  }
+    }
+  }  // end of CPU fallback
 
   if (phiObs) {
     knUnprojectNormalComp(flags, vel, *phiObs, distance);
@@ -1167,6 +1172,11 @@ template<class S> struct knSetRemaining : public KernelBase {
 
 void extrapolateLsSimple(Grid<Real> &phi, int distance = 4, bool inside = false)
 {
+  /* Optional CUDA path (MANTA_CUDA=1). */
+  if (manta_cuda::enabled() && cudaExtrapolateLsSimple(phi, distance, inside)) {
+    return;
+  }
+
   Grid<int> tmp(phi.getParent());
   tmp.clear();
   const int dim = (phi.is3D() ? 3 : 2);

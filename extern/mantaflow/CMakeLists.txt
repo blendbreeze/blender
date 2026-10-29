@@ -233,6 +233,32 @@ if(WITH_MANTA_NUMPY AND WITH_PYTHON_NUMPY)
   )
 endif()
 
+# Experimental CUDA acceleration for select mantaflow kernels (flood fill,
+# levelset / MAC extrapolation). Enabled per-run with MANTA_CUDA=1.
+option(WITH_MANTA_CUDA "Enable experimental CUDA kernels in mantaflow" OFF)
+if(WITH_MANTA_CUDA)
+  enable_language(CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 120)
+  endif()
+  # CMake adds MSVC-only /external:* and /utf-8 flags that nvcc cannot parse
+  # (it mistakes the path after /external:I for a second input file).
+  string(REGEX REPLACE "/external:I +[^ ]+" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+  foreach(_f "/utf-8" "/experimental:external" "/external:W0")
+    string(REPLACE "${_f}" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+  endforeach()
+  list(APPEND SRC
+    ${MANTA_PP}/manta_cuda.h
+    ${MANTA_PP}/manta_cuda_kernels.cu
+  )
+  list(APPEND LIB PRIVATE CUDA::cudart)
+else()
+  list(APPEND SRC
+    ${MANTA_PP}/manta_cuda.h
+    ${MANTA_PP}/manta_cuda_stub.cpp
+  )
+endif()
+
 set(LIB
   PRIVATE bf::dependencies::optional::openvdb
   PRIVATE bf::dependencies::optional::tbb

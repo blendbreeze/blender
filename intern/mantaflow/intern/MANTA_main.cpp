@@ -15,6 +15,7 @@
 #include <Python.h>
 
 #include <manta.h>
+#include <timing.h>
 
 #include "MANTA_main.h"
 #include "fluid_script.h"
@@ -1285,7 +1286,14 @@ bool MANTA::writeData(FluidModifierData *fmd, int framenr)
        << ", '" << volume_format << "', " << resumable_cache << ")";
     pythonCommands.push_back(ss.str());
   }
-  return runPythonString(pythonCommands);
+  bool success = runPythonString(pythonCommands);
+
+  /* Optional solver plugin timing output for profiling (MANTA_PROFILE=1). */
+  if (getenv("MANTA_PROFILE") && framenr == fds->cache_frame_end) {
+    Manta::TimingData::instance().print();
+  }
+
+  return success;
 }
 
 bool MANTA::writeNoise(FluidModifierData *fmd, int framenr)
