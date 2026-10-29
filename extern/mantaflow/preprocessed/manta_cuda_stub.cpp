@@ -39,4 +39,14 @@ bool cudaAdvectSemiLagrangeScalar(const FlagGrid & /*flags*/,
   return false;
 }
 
+bool cudaSolvePressureCg(Grid<Real> & /*rhs*/,
+                         Grid<Real> & /*pressure*/,
+                         FlagGrid & /*flags*/,
+                         Real /*cgAccuracy*/,
+                         MACGrid * /*fractions*/,
+                         Real /*cgMaxIterFac*/)
+{
+  return false;
+}
+
 }  // namespace Manta

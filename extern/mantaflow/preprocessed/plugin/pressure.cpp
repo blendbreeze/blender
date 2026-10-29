@@ -19,6 +19,7 @@
 #include "kernel.h"
 #include "conjugategrad.h"
 #include "multigrid.h"
+#include "manta_cuda.h"
 
 using namespace std;
 namespace Manta {
@@ -1066,6 +1067,24 @@ void solvePressureSystem(Grid<Real> &rhs,
 {
   if (precondition == false)
     preconditioner = PcNone;  // for backwards compatibility
+
+  /* Optional CUDA path: unpreconditioned CG on the GPU. Same system and
+   * accuracy as the CPU solve (rhs build and velocity correction remain on
+   * the CPU). Falls back when ghost-fluid / per-cell corrections are active
+   * or a pressure needs pinning (fully flooded closed domain). */
+  if (phi == nullptr && perCellCorr == nullptr && vel.is3D() && manta_cuda::enabled() &&
+      !(zeroPressureFixing && (int)CountEmptyCells(flags) == 0))
+  {
+    if (cudaSolvePressureCg(rhs,
+                            pressure,
+                            const_cast<FlagGrid &>(flags),
+                            cgAccuracy,
+                            const_cast<MACGrid *>(fractions),
+                            cgMaxIterFac))
+    {
+      return;
+    }
+  }
 
   // reserve temp grids
   FluidSolver *parent = flags.getParent();

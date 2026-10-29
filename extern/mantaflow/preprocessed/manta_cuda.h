@@ -27,6 +27,15 @@ bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool 
 /* advectSemiLagrange for a scalar grid, order 1 / linear / first-order trace. */
 bool cudaAdvectSemiLagrangeScalar(const FlagGrid &flags, MACGrid &vel, Grid<Real> &grid, Real dt);
 
+/* Pressure solve: unpreconditioned CG on the GPU (same system / accuracy as
+ * the CPU solve). RHS build and velocity correction stay on the CPU. */
+bool cudaSolvePressureCg(Grid<Real> &rhs,
+                         Grid<Real> &pressure,
+                         FlagGrid &flags,
+                         Real cgAccuracy,
+                         MACGrid *fractions,
+                         Real cgMaxIterFac);
+
 }  // namespace Manta
 
 #endif /* _MANTA_CUDA_H */

@@ -542,6 +542,266 @@ __global__ void slScalar(const float *__restrict__ vel,
 }
 
 // ---------------------------------------------------------------------------
+// pressure solve (unpreconditioned CG), 1:1 with MakeLaplaceMatrix /
+// ApplyMatrix / GridCg(PcNone) / correctVelocity in the CPU code
+
+// Persistent buffers for the pressure solve (grow-only).
+struct PressBufs {
+  int *flags = nullptr;   // n
+  float *rhs = nullptr;   // n
+  float *frac = nullptr;  // 3n (obstacle fractions, optional input)
+  float *p = nullptr;     // n pressure
+  float *res = nullptr;
+  float *search = nullptr;
+  float *tmp = nullptr;
+  float *A0 = nullptr;
+  float *Ai = nullptr;
+  float *Aj = nullptr;
+  float *Ak = nullptr;
+  double *dotOut = nullptr;
+  unsigned long long *maxOut = nullptr;
+  float *hRhs = nullptr;
+  float *hP = nullptr;
+  float *hFrac = nullptr;
+  int *hFlags = nullptr;
+  long cap = 0;
+
+  bool ensure(long cells)
+  {
+    if (cells <= cap) {
+      return true;
+    }
+    freeAll();
+    bool ok = cudaMalloc(&flags, cells * sizeof(int)) == cudaSuccess;
+    ok = ok && cudaMalloc(&rhs, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&frac, 3 * cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&p, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&res, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&search, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&tmp, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&A0, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&Ai, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&Aj, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&Ak, cells * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&dotOut, sizeof(double)) == cudaSuccess;
+    ok = ok && cudaMalloc(&maxOut, sizeof(unsigned long long)) == cudaSuccess;
+    ok = ok && cudaHostAlloc((void **)&hRhs, cells * sizeof(float), cudaHostAllocDefault) ==
+             cudaSuccess;
+    ok = ok && cudaHostAlloc((void **)&hP, cells * sizeof(float), cudaHostAllocDefault) ==
+             cudaSuccess;
+    ok = ok && cudaHostAlloc((void **)&hFrac, 3 * cells * sizeof(float), cudaHostAllocDefault) ==
+             cudaSuccess;
+    ok = ok && cudaHostAlloc((void **)&hFlags, cells * sizeof(int), cudaHostAllocDefault) ==
+             cudaSuccess;
+    if (!ok) {
+      cudaFail("pressure buffer alloc", cudaGetLastError());
+      freeAll();
+      return false;
+    }
+    cap = cells;
+    return true;
+  }
+  void freeAll()
+  {
+    cudaFree(flags);
+    cudaFree(rhs);
+    cudaFree(frac);
+    cudaFree(p);
+    cudaFree(res);
+    cudaFree(search);
+    cudaFree(tmp);
+    cudaFree(A0);
+    cudaFree(Ai);
+    cudaFree(Aj);
+    cudaFree(Ak);
+    cudaFree(dotOut);
+    cudaFree(maxOut);
+    cudaFreeHost(hRhs);
+    cudaFreeHost(hP);
+    cudaFreeHost(hFrac);
+    cudaFreeHost(hFlags);
+    flags = nullptr;
+    rhs = frac = p = res = search = tmp = nullptr;
+    A0 = Ai = Aj = Ak = nullptr;
+    dotOut = nullptr;
+    maxOut = nullptr;
+    hRhs = hP = hFrac = nullptr;
+    hFlags = nullptr;
+    cap = 0;
+  }
+};
+
+static PressBufs g_pc;
+
+// Same as MakeLaplaceMatrix (interior only; A-grids must be zeroed first).
+__global__ void cgMakeMatrix(const int *__restrict__ flags,
+                             float *__restrict__ A0,
+                             float *__restrict__ Ai,
+                             float *__restrict__ Aj,
+                             float *__restrict__ Ak,
+                             const float *__restrict__ frac, /* 3 per cell or null */
+                             int sx,
+                             int sy,
+                             int sz,
+                             long strideZ)
+{
+  long n = (long)sx * sy * sz;
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    int i, j, k;
+    coords(t, sx, strideZ, &i, &j, &k);
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
+      continue;
+    }
+    if (!(flags[t] & 1)) {  // fluid
+      continue;
+    }
+    if (frac == nullptr) {
+      if (!(flags[t - 1] & 2))
+        A0[t] += 1.f;
+      if (!(flags[t + 1] & 2))
+        A0[t] += 1.f;
+      if (!(flags[t - sx] & 2))
+        A0[t] += 1.f;
+      if (!(flags[t + sx] & 2))
+        A0[t] += 1.f;
+      if (!(flags[t - strideZ] & 2))
+        A0[t] += 1.f;
+      if (!(flags[t + strideZ] & 2))
+        A0[t] += 1.f;
+      if (flags[t + 1] & 1)
+        Ai[t] = -1.f;
+      if (flags[t + sx] & 1)
+        Aj[t] = -1.f;
+      if (flags[t + strideZ] & 1)
+        Ak[t] = -1.f;
+    }
+    else {
+      A0[t] += frac[3 * t] + frac[3 * (t + 1)] + frac[3 * t + 1] + frac[3 * (t + sx) + 1] +
+               frac[3 * t + 2] + frac[3 * (t + strideZ) + 2];
+      if (flags[t + 1] & 1)
+        Ai[t] = -frac[3 * (t + 1)];
+      if (flags[t + sx] & 1)
+        Aj[t] = -frac[3 * (t + sx) + 1];
+      if (flags[t + strideZ] & 1)
+        Ak[t] = -frac[3 * (t + strideZ) + 2];
+    }
+  }
+}
+
+// Same as ApplyMatrix (whole grid; non-fluid cells copy src through).
+__global__ void cgApplyMat(const int *__restrict__ flags,
+                           float *__restrict__ dst,
+                           const float *__restrict__ src,
+                           const float *__restrict__ A0,
+                           const float *__restrict__ Ai,
+                           const float *__restrict__ Aj,
+                           const float *__restrict__ Ak,
+                           int sx,
+                           int sy,
+                           int sz,
+                           long strideZ)
+{
+  long n = (long)sx * sy * sz;
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    if (!(flags[t] & 1)) {
+      dst[t] = src[t];
+      continue;
+    }
+    // Neighbor reads are in bounds for all fluid cells of the interior box;
+    // clamp at the outer border (walls, never fluid in practice).
+    long xm = (t % sx == 0) ? t : t - 1;
+    long ym = ((t / sx) % sy == 0) ? t : t - sx;
+    long zm = (t / strideZ == 0) ? t : t - strideZ;
+    long xp = (t % sx == sx - 1) ? t : t + 1;
+    long yp = ((t / sx) % sy == sy - 1) ? t : t + sx;
+    long zp = (t / strideZ == sz - 1) ? t : t + strideZ;
+    dst[t] = src[t] * A0[t] + src[xm] * Ai[xm] + src[xp] * Ai[t] + src[ym] * Aj[ym] +
+             src[yp] * Aj[t] + src[zm] * Ak[zm] + src[zp] * Ak[t];
+  }
+}
+
+__global__ void cgCopy(float *__restrict__ dst, const float *__restrict__ src, long n)
+{
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    dst[t] = src[t];
+  }
+}
+
+// p += alpha * search; res -= alpha * tmp(Ap); tmp = res   (one fused pass)
+__global__ void cgUpdate(float *__restrict__ p,
+                         float *__restrict__ res,
+                         float *__restrict__ tmp,
+                         const float *__restrict__ search,
+                         float alpha,
+                         long n)
+{
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    p[t] += alpha * search[t];
+    res[t] -= alpha * tmp[t];
+    tmp[t] = res[t];
+  }
+}
+
+// search = tmp + beta * search
+__global__ void cgSearchUpdate(float *__restrict__ search,
+                               const float *__restrict__ tmp,
+                               float beta,
+                               long n)
+{
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    search[t] = tmp[t] + beta * search[t];
+  }
+}
+
+// Double-precision dot product (block reduce + atomicAdd), and optionally the
+// max-abs norm of r in the same pass (bit trick: fabs bits are monotonic).
+__global__ void cgDotMax(const float *__restrict__ a,
+                         const float *__restrict__ b,
+                         const float *__restrict__ r,
+                         long n,
+                         double *dotOut,
+                         unsigned long long *maxOut)
+{
+  __shared__ double sh[256];
+  __shared__ unsigned int shm[256];
+  double s = 0.0;
+  unsigned int m = 0u;
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    s += (double)a[t] * (double)b[t];
+    if (r != nullptr) {
+      unsigned int bits = __float_as_uint(fabsf(r[t]));
+      if (bits > m) {
+        m = bits;
+      }
+    }
+  }
+  sh[threadIdx.x] = s;
+  shm[threadIdx.x] = m;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      sh[threadIdx.x] += sh[threadIdx.x + off];
+      if (shm[threadIdx.x + off] > shm[threadIdx.x]) {
+        shm[threadIdx.x] = shm[threadIdx.x + off];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicAdd(dotOut, sh[0]);
+    if (r != nullptr) {
+      atomicMax(maxOut, (unsigned long long)shm[0]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // host entry points (declared in Manta namespace, see manta_cuda.h)
 
 static int blocksFor(long n)
@@ -720,6 +980,116 @@ bool cudaAdvectSemiLagrangeScalar(const FlagGrid &flags, MACGrid &vel, Grid<Real
           "advectScalar: copy out");
   CUDA_RC(cudaStreamSynchronize(0), "advectScalar: sync");
   memcpy(&grid(0), buf.hFlags, n * sizeof(float));
+  return true;
+}
+
+bool cudaSolvePressureCg(Grid<Real> &rhs,
+                         Grid<Real> &pressure,
+                         FlagGrid &flags,
+                         Real cgAccuracy,
+                         MACGrid *fractions,
+                         Real cgMaxIterFac)
+{
+  using namespace manta_cuda;
+  if (!enabled()) {
+    return false;
+  }
+  const int sx = flags.getSizeX(), sy = flags.getSizeY(), sz = flags.getSizeZ();
+  const long n = (long)sx * sy * sz;
+  const long strideZ = (long)sx * sy;
+  if (n <= 0 || n >= (long)INT_MAX || sz < 2) {
+    return false;
+  }
+  const long bytes = n * sizeof(float);
+
+  if (!g_pc.ensure(n)) {
+    return false;
+  }
+  PressBufs &buf = g_pc;
+  memcpy(buf.hRhs, &rhs(0), bytes);
+  memcpy(buf.hFlags, &flags(0), bytes);
+  const bool haveFrac = (fractions != nullptr);
+  if (haveFrac) {
+    memcpy(buf.hFrac, &(*fractions)(0), 3 * bytes);
+  }
+  CUDA_RC(cudaMemcpyAsync(buf.rhs, buf.hRhs, bytes, cudaMemcpyHostToDevice),
+          "pressure: rhs copy in");
+  CUDA_RC(cudaMemcpyAsync(buf.flags, buf.hFlags, bytes, cudaMemcpyHostToDevice),
+          "pressure: flags copy in");
+  if (haveFrac) {
+    CUDA_RC(cudaMemcpyAsync(buf.frac, buf.hFrac, 3 * bytes, cudaMemcpyHostToDevice),
+            "pressure: fractions copy in");
+  }
+  CUDA_RC(cudaMemsetAsync(buf.p, 0, bytes), "pressure: memset p");
+  CUDA_RC(cudaMemsetAsync(buf.A0, 0, bytes), "pressure: memset A0");
+  CUDA_RC(cudaMemsetAsync(buf.Ai, 0, bytes), "pressure: memset Ai");
+  CUDA_RC(cudaMemsetAsync(buf.Aj, 0, bytes), "pressure: memset Aj");
+  CUDA_RC(cudaMemsetAsync(buf.Ak, 0, bytes), "pressure: memset Ak");
+
+  cgMakeMatrix<<<blocksFor(n), 256>>>(
+      buf.flags, buf.A0, buf.Ai, buf.Aj, buf.Ak, haveFrac ? buf.frac : nullptr, sx, sy, sz,
+      strideZ);
+  cudaError_t lrc = cudaGetLastError();
+  if (lrc != cudaSuccess) {
+    cudaFail("pressure: matrix launch", lrc);
+    return false;
+  }
+
+  const int gridDim = (sx > sy && sx > sz) ? sx : ((sy > sz) ? sy : sz);
+  // Unpreconditioned CG needs more iterations than the CPU MIC variant;
+  // each iteration is far cheaper on the GPU.
+  const int maxIter = 2 * (int)(cgMaxIterFac * (Real)gridDim);
+
+  // doInit: res = rhs, search = res (PcNone), sigma = dot(res, rhs)
+  cgCopy<<<blocksFor(n), 256>>>(buf.res, buf.rhs, n);
+  cgCopy<<<blocksFor(n), 256>>>(buf.search, buf.rhs, n);
+  double sigma = 0.0;
+  CUDA_RC(cudaMemsetAsync(buf.dotOut, 0, sizeof(double)), "pressure: memset dot");
+  cgDotMax<<<blocksFor(n), 256>>>(buf.res, buf.rhs, nullptr, n, buf.dotOut, nullptr);
+  CUDA_RC(cudaStreamSynchronize(0), "pressure: init sync");
+  CUDA_RC(cudaMemcpy(&sigma, buf.dotOut, sizeof(double), cudaMemcpyDeviceToHost),
+          "pressure: init dot read");
+
+  for (int iter = 0; iter < maxIter && sigma > 0.0; iter++) {
+    cgApplyMat<<<blocksFor(n), 256>>>(
+        buf.flags, buf.tmp, buf.search, buf.A0, buf.Ai, buf.Aj, buf.Ak, sx, sy, sz, strideZ);
+    CUDA_RC(cudaMemsetAsync(buf.dotOut, 0, sizeof(double)), "pressure: memset dot");
+    cgDotMax<<<blocksFor(n), 256>>>(buf.tmp, buf.search, nullptr, n, buf.dotOut, nullptr);
+    CUDA_RC(cudaStreamSynchronize(0), "pressure: iter sync 1");
+    double dp = 0.0;
+    CUDA_RC(cudaMemcpy(&dp, buf.dotOut, sizeof(double), cudaMemcpyDeviceToHost),
+            "pressure: dot read");
+    float alpha = 0.f;
+    if (fabs(dp) > 0.0) {
+      alpha = (float)(sigma / dp);
+    }
+    cgUpdate<<<blocksFor(n), 256>>>(buf.p, buf.res, buf.tmp, buf.search, alpha, n);
+    CUDA_RC(cudaMemsetAsync(buf.dotOut, 0, sizeof(double)), "pressure: memset dot2");
+    CUDA_RC(cudaMemsetAsync(buf.maxOut, 0, sizeof(unsigned long long)), "pressure: memset max");
+    cgDotMax<<<blocksFor(n), 256>>>(buf.tmp, buf.res, buf.res, n, buf.dotOut, buf.maxOut);
+    CUDA_RC(cudaStreamSynchronize(0), "pressure: iter sync 2");
+    double sigmaNew = 0.0;
+    unsigned long long maxBits = 0;
+    CUDA_RC(cudaMemcpy(&sigmaNew, buf.dotOut, sizeof(double), cudaMemcpyDeviceToHost),
+            "pressure: dot2 read");
+    CUDA_RC(cudaMemcpy(&maxBits, buf.maxOut, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+            "pressure: max read");
+    float resNorm;
+    memcpy(&resNorm, &maxBits, 4);  // low 32 bits hold the float bits
+    if (resNorm < (float)cgAccuracy) {
+      break;
+    }
+    float beta = 0.f;
+    if (fabs(sigma) > 0.0) {
+      beta = (float)(sigmaNew / sigma);
+    }
+    cgSearchUpdate<<<blocksFor(n), 256>>>(buf.search, buf.tmp, beta, n);
+    sigma = sigmaNew;
+  }
+
+  CUDA_RC(cudaMemcpyAsync(buf.hP, buf.p, bytes, cudaMemcpyDeviceToHost), "pressure: copy out");
+  CUDA_RC(cudaStreamSynchronize(0), "pressure: final sync");
+  memcpy(&pressure(0), buf.hP, bytes);
   return true;
 }
 
