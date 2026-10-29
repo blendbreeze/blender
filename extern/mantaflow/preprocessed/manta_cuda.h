@@ -24,6 +24,9 @@ bool cudaExtrapolateLsSimple(Grid<Real> &phi, int distance, bool inside);
 /* extrapolateMACSimple - all axis passes of the mark + dilation loops. */
 bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool intoObs, int dim);
 
+/* advectSemiLagrange for a scalar grid, order 1 / linear / first-order trace. */
+bool cudaAdvectSemiLagrangeScalar(const FlagGrid &flags, MACGrid &vel, Grid<Real> &grid, Real dt);
+
 }  // namespace Manta
 
 #endif /* _MANTA_CUDA_H */

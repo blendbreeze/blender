@@ -31,4 +31,12 @@ bool cudaExtrapolateMACSimple(FlagGrid & /*flags*/,
   return false;
 }
 
+bool cudaAdvectSemiLagrangeScalar(const FlagGrid & /*flags*/,
+                                  MACGrid & /*vel*/,
+                                  Grid<Real> & /*grid*/,
+                                  Real /*dt*/)
+{
+  return false;
+}
+
 }  // namespace Manta

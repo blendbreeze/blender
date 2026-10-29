@@ -92,10 +92,11 @@ bool enabled()
 // (3 floats per cell) depending on the operation.
 struct DevBuffers {
   float *phi = nullptr;    // device: scalar or MAC data
-  int *ibuf = nullptr;     // device: visited / tmp
+  float *phi2 = nullptr;   // device: second scalar buffer (advection source)
+  int *ibuf = nullptr;     // device: visited / tmp (also reused as float dst)
   int *flagsBuf = nullptr; // device: flag grid copy
   float *hPhi = nullptr;   // pinned host staging for phi
-  int *hFlags = nullptr;   // pinned host staging for flags
+  int *hFlags = nullptr;   // pinned host staging for flags / scalar bytes
   long phiFloats = 0;
   long intCells = 0;
 
@@ -106,6 +107,7 @@ struct DevBuffers {
     }
     freeAll();
     bool ok = cudaMalloc(&phi, needFloats * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&phi2, needFloats * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&ibuf, needInts * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&flagsBuf, needInts * sizeof(int)) == cudaSuccess;
     ok = ok && cudaHostAlloc((void **)&hPhi, needFloats * sizeof(float), cudaHostAllocDefault) ==
@@ -124,11 +126,13 @@ struct DevBuffers {
   void freeAll()
   {
     cudaFree(phi);
+    cudaFree(phi2);
     cudaFree(ibuf);
     cudaFree(flagsBuf);
     cudaFreeHost(hPhi);
     cudaFreeHost(hFlags);
     phi = nullptr;
+    phi2 = nullptr;
     ibuf = nullptr;
     flagsBuf = nullptr;
     hPhi = nullptr;
@@ -452,6 +456,92 @@ __global__ void macDilate(float *__restrict__ vel,
 }
 
 // ---------------------------------------------------------------------------
+// scalar semi-Lagrange advection (order 1, linear, first-order trace)
+
+// Exact device port of mantaflow's BUILD_INDEX + interpol (linear, clamped).
+__device__ __forceinline__ float interpLinear(const float *__restrict__ data,
+                                              int sx,
+                                              int sy,
+                                              int sz,
+                                              long strideZ,
+                                              float px0,
+                                              float py0,
+                                              float pz0)
+{
+  float px = px0 - 0.5f, py = py0 - 0.5f, pz = pz0 - 0.5f;
+  int xi = (int)px, yi = (int)py, zi = (int)pz;
+  float s1 = px - (float)xi, s0 = 1.f - s1;
+  float t1 = py - (float)yi, t0 = 1.f - t1;
+  float f1 = pz - (float)zi, f0 = 1.f - f1;
+  if (px < 0.f) {
+    xi = 0;
+    s0 = 1.f;
+    s1 = 0.f;
+  }
+  if (py < 0.f) {
+    yi = 0;
+    t0 = 1.f;
+    t1 = 0.f;
+  }
+  if (pz < 0.f) {
+    zi = 0;
+    f0 = 1.f;
+    f1 = 0.f;
+  }
+  if (xi >= sx - 1) {
+    xi = sx - 2;
+    s0 = 0.f;
+    s1 = 1.f;
+  }
+  if (yi >= sy - 1) {
+    yi = sy - 2;
+    t0 = 0.f;
+    t1 = 1.f;
+  }
+  if (sz > 1 && zi >= sz - 1) {
+    zi = sz - 2;
+    f0 = 0.f;
+    f1 = 1.f;
+  }
+  const long X = 1, Y = sx, Z = strideZ;
+  long idx = xi + Y * yi + Z * zi;
+  return ((data[idx] * t0 + data[idx + Y] * t1) * s0 +
+          (data[idx + X] * t0 + data[idx + X + Y] * t1) * s1) *
+             f0 +
+         ((data[idx + Z] * t0 + data[idx + Y + Z] * t1) * s0 +
+          (data[idx + X + Z] * t0 + data[idx + X + Y + Z] * t1) * s1) *
+             f1;
+}
+
+__global__ void slScalar(const float *__restrict__ vel,
+                         const float *__restrict__ src,
+                         float *__restrict__ dst,
+                         int sx,
+                         int sy,
+                         int sz,
+                         long strideZ,
+                         float dt)
+{
+  long n = (long)sx * sy * sz;
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    int i, j, k;
+    coords(t, sx, strideZ, &i, &j, &k);
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
+      continue;
+    }
+    // MACGrid::getCentered: average of the two adjacent faces per axis.
+    const float vx = 0.5f * (vel[3 * t] + vel[3 * (t + 1)]);
+    const float vy = 0.5f * (vel[3 * t + 1] + vel[3 * (t + sx) + 1]);
+    const float vz = (sz > 1) ? 0.5f * (vel[3 * t + 2] + vel[3 * (t + strideZ) + 2]) : 0.f;
+    const float x = ((float)i + 0.5f) - vx * dt;
+    const float y = ((float)j + 0.5f) - vy * dt;
+    const float z = ((float)k + 0.5f) - vz * dt;
+    dst[t] = interpLinear(src, sx, sy, sz, strideZ, x, y, z);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // host entry points (declared in Manta namespace, see manta_cuda.h)
 
 static int blocksFor(long n)
@@ -590,6 +680,46 @@ bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool 
           "extrapolateMAC: copy out");
   CUDA_RC(cudaStreamSynchronize(0), "extrapolateMAC: sync");
   memcpy(&vel(0), buf.hPhi, velBytes);
+  return true;
+}
+
+bool cudaAdvectSemiLagrangeScalar(const FlagGrid &flags, MACGrid &vel, Grid<Real> &grid, Real dt)
+{
+  using namespace manta_cuda;
+  if (!enabled()) {
+    return false;
+  }
+  const int sx = flags.getSizeX(), sy = flags.getSizeY(), sz = flags.getSizeZ();
+  const long n = (long)sx * sy * sz;
+  const long strideZ = (long)sx * sy;
+  if (n <= 0 || n >= (long)INT_MAX) {
+    return false;
+  }
+  const long velFloats = 3 * n;
+
+  if (!g_dev.ensure(velFloats, n)) {
+    return false;
+  }
+  DevBuffers &buf = g_dev;
+  memcpy(buf.hPhi, &vel(0), velFloats * sizeof(float));
+  memcpy(buf.hFlags, &grid(0), n * sizeof(float));  // scalar src via flags staging
+  CUDA_RC(cudaMemcpyAsync(buf.phi, buf.hPhi, velFloats * sizeof(float), cudaMemcpyHostToDevice),
+          "advectScalar: vel copy in");
+  CUDA_RC(cudaMemcpyAsync(buf.phi2, buf.hFlags, n * sizeof(float), cudaMemcpyHostToDevice),
+          "advectScalar: src copy in");
+
+  slScalar<<<blocksFor(n), 256>>>(
+      buf.phi, buf.phi2, (float *)buf.ibuf, sx, sy, sz, strideZ, (float)dt);
+  cudaError_t lrc = cudaGetLastError();
+  if (lrc != cudaSuccess) {
+    cudaFail("advectScalar: launch", lrc);
+    return false;
+  }
+
+  CUDA_RC(cudaMemcpyAsync(buf.hFlags, buf.ibuf, n * sizeof(float), cudaMemcpyDeviceToHost),
+          "advectScalar: copy out");
+  CUDA_RC(cudaStreamSynchronize(0), "advectScalar: sync");
+  memcpy(&grid(0), buf.hFlags, n * sizeof(float));
   return true;
 }
 

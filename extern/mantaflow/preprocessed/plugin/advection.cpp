@@ -16,8 +16,11 @@
  *
  ******************************************************************************/
 
+#include <type_traits>
+
 #include "vectorbase.h"
 #include "grid.h"
+#include "manta_cuda.h"
 #include "kernel.h"
 #include <limits>
 
@@ -1014,6 +1017,16 @@ void fnAdvectSemiLagrange(FluidSolver *parent,
 
   Real dt = parent->getDt();
   bool levelset = orig.getType() & GridBase::TypeLevelset;
+
+  /* Optional CUDA path for the common linear first-order scalar case. */
+  if constexpr (std::is_same_v<T, Real>) {
+    if (order == 1 && orderTrace == 1 && orderSpace == 1) {
+      if (manta_cuda::enabled() &&
+          cudaAdvectSemiLagrangeScalar(flags, const_cast<MACGrid &>(vel), orig, dt)) {
+        return;
+      }
+    }
+  }
 
   // forward step
   GridType fwd(parent);
