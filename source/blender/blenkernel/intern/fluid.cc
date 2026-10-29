@@ -838,7 +838,8 @@ BLI_INLINE void apply_effector_fields(FluidEffectorSettings *fes,
                                       float *dest_vel_y,
                                       float *dest_vel_z,
                                       float *dest_stickiness,
-                                      float *dest_friction)
+                                      float *dest_friction,
+                                      float *dest_adhesion)
 {
   /* Ensure that distance value is "joined" into the levelset. */
   if (dest_phi_in) {
@@ -857,13 +858,16 @@ BLI_INLINE void apply_effector_fields(FluidEffectorSettings *fes,
     dest_vel_z[index] += src_vel_value[2];
   }
 
-  /* Accumulate per-object stickiness / friction near the obstacle surface (max blend). */
+  /* Accumulate per-object stickiness / friction / adhesion near the obstacle surface (max blend). */
   if (fes->type == FLUID_EFFECTOR_TYPE_COLLISION && src_distance_value < 3.0f) {
     if (dest_stickiness) {
       dest_stickiness[index] = std::max(fes->stickiness, dest_stickiness[index]);
     }
     if (dest_friction) {
       dest_friction[index] = std::max(fes->friction, dest_friction[index]);
+    }
+    if (dest_adhesion) {
+      dest_adhesion[index] = std::max(fes->adhesion, dest_adhesion[index]);
     }
   }
 }
@@ -1354,11 +1358,12 @@ static void update_obstacles(Depsgraph *depsgraph,
   float *phi_guide_in = manta_get_phiguide_in(fds->fluid);
   float *num_obstacles = manta_get_num_obstacle(fds->fluid);
   float *num_guides = manta_get_num_guide(fds->fluid);
-  /* Stickiness / friction guides are max-blended over time (no per-frame reset) so that
-   * static collision objects keep their values. The solver only applies them where the
+  /* Stickiness / friction / adhesion guides are max-blended over time (no per-frame reset) so
+   * that static collision objects keep their values. The solver only applies them where the
    * (per frame rebuilt) obstacle levelset is within its band. */
   float *stickiness_guide = manta_get_stickiness_guide(fds->fluid);
   float *friction_guide = manta_get_friction_guide(fds->fluid);
+  float *adhesion_guide = manta_get_adhesion_guide(fds->fluid);
   uint z;
 
   bool use_adaptivedomain = (fds->flags & FLUID_DOMAIN_USE_ADAPTIVE_DOMAIN);
@@ -1465,7 +1470,8 @@ static void update_obstacles(Depsgraph *depsgraph,
                                     vel_y,
                                     vel_z,
                                     stickiness_guide,
-                                    friction_guide);
+                                    friction_guide,
+                                    adhesion_guide);
             }
             if (fes->type == FLUID_EFFECTOR_TYPE_GUIDE) {
               apply_effector_fields(fes,
@@ -1478,6 +1484,7 @@ static void update_obstacles(Depsgraph *depsgraph,
                                     vel_x_guide,
                                     vel_y_guide,
                                     vel_z_guide,
+                                    nullptr,
                                     nullptr,
                                     nullptr);
             }
@@ -5112,6 +5119,7 @@ void BKE_fluid_modifier_copy(const FluidModifierData *fmd, FluidModifierData *tf
     /* collision options */
     tfes->stickiness = fes->stickiness;
     tfes->friction = fes->friction;
+    tfes->adhesion = fes->adhesion;
 
     /* guide options */
     tfes->guide_mode = fes->guide_mode;

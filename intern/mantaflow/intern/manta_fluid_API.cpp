@@ -258,6 +258,10 @@ float *manta_get_friction_guide(MANTA *fluid)
 {
   return fluid->getFrictionGuide();
 }
+float *manta_get_adhesion_guide(MANTA *fluid)
+{
+  return fluid->getAdhesionGuide();
+}
 
 int manta_get_res_x(MANTA *fluid)
 {

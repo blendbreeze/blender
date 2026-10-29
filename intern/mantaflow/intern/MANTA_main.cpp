@@ -2239,6 +2239,9 @@ void MANTA::updatePointers(FluidModifierData *fmd, bool flush)
                          nullptr;
   mFrictionGuide = (obstacle && liquid) ? getPointer<float>("friction" + s_ext, func) :
                                           nullptr;
+  mAdhesionGuide = (obstacle && liquid) ?
+                       getPointer<float>("adhesion" + s_ext, func) :
+                       nullptr;
 
   /* Guiding. */
   mPhiGuideIn = (guiding) ? getPointer<float>("phiGuideIn" + s_ext, func) : nullptr;

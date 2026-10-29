@@ -3012,6 +3012,15 @@ static void rna_def_fluid_effector_settings(BlenderRNA *brna)
                            "Amount of adhesion keeping liquid in contact with this obstacle");
   RNA_def_property_update(prop, NC_OBJECT | ND_MODIFIER, "rna_Fluid_effector_reset");
 
+  prop = RNA_def_property(srna, "adhesion", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_range(prop, 0.0, 1.0);
+  RNA_def_property_ui_range(prop, 0.0, 1.0, 0.05, 2);
+  RNA_def_property_ui_text(prop,
+                           "Adhesion",
+                           "Active pull toward this obstacle's surface; at 1.0 it can hold "
+                           "liquid against gravity");
+  RNA_def_property_update(prop, NC_OBJECT | ND_MODIFIER, "rna_Fluid_effector_reset");
+
   prop = RNA_def_property(srna, "use_plane_init", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "flags", FLUID_EFFECTOR_USE_PLANE_INIT);
   RNA_def_property_ui_text(prop, "Is Planar", "Treat this object as a planar, unclosed mesh");

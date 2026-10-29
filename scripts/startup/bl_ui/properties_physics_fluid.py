@@ -283,6 +283,7 @@ class PHYSICS_PT_settings(PhysicButtonsPanel, Panel):
             if effector_settings.effector_type == 'COLLISION':
                 col.prop(effector_settings, "friction", text="Friction")
                 col.prop(effector_settings, "stickiness", text="Stickiness")
+                col.prop(effector_settings, "adhesion", text="Adhesion")
 
             col = grid.column()
 

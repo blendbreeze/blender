@@ -1751,7 +1751,15 @@ void PbRegister_pushOutofObs()
 }
 
 //******************************************************************************
-// obstacle stickiness / friction
+// obstacle stickiness / friction / adhesion
+
+/* Empirical gain for the adhesion pull: the pull applied per substep is this
+ * multiple of the velocity gravity adds in one substep. The gain compensates
+ * for the FLIP velocity transfer and pressure projection partially
+ * overwriting the pull each step, so that adhesion=1 can hold liquid against
+ * gravity. The pull remains bounded per substep (it presses fluid onto the
+ * surface; pushOutofObs keeps particles out of the solid). */
+static const Real ADHESION_GAIN = 3.0;
 
 struct knApplyObstacleStickiness : public KernelBase {
   knApplyObstacleStickiness(BasicParticleSystem &parts,
@@ -1761,7 +1769,10 @@ struct knApplyObstacleStickiness : public KernelBase {
                             const MACGrid &obvel,
                             const Grid<Real> &stickGuide,
                             const Grid<Real> &fricGuide,
-                            const Real band)
+                            const Grid<Real> &adhGuide,
+                            const Real band,
+                            const Real dt,
+                            const Real gmag)
       : KernelBase(parts.size()),
         parts(parts),
         pvel(pvel),
@@ -1770,7 +1781,10 @@ struct knApplyObstacleStickiness : public KernelBase {
         obvel(obvel),
         stickGuide(stickGuide),
         fricGuide(fricGuide),
-        band(band)
+        adhGuide(adhGuide),
+        band(band),
+        dt(dt),
+        gmag(gmag)
   {
     runMessage();
     run();
@@ -1783,7 +1797,10 @@ struct knApplyObstacleStickiness : public KernelBase {
                  const MACGrid &obvel,
                  const Grid<Real> &stickGuide,
                  const Grid<Real> &fricGuide,
-                 const Real band) const
+                 const Grid<Real> &adhGuide,
+                 const Real band,
+                 const Real dt,
+                 const Real gmag) const
   {
     if (!parts.isActive(idx))
       return;
@@ -1792,10 +1809,11 @@ struct knApplyObstacleStickiness : public KernelBase {
     if (!flags.isInBounds(p))
       return;
 
-    // Per-object stickiness / friction values (0 if not near a sticky obstacle)
+    // Per-object stickiness / friction / adhesion values (0 if not near a sticky obstacle)
     const Real s = stickGuide.getInterpolated(pos);
     const Real f = fricGuide.getInterpolated(pos);
-    if (s <= VECTOR_EPSILON && f <= VECTOR_EPSILON)
+    const Real a = adhGuide.getInterpolated(pos);
+    if (s <= VECTOR_EPSILON && f <= VECTOR_EPSILON && a <= VECTOR_EPSILON)
       return;
 
     // phiObs is positive on the fluid side of the obstacle surface
@@ -1820,6 +1838,13 @@ struct knApplyObstacleStickiness : public KernelBase {
     // Friction dampens tangential slip, stickiness dampens separation from the surface
     vt *= 1.0 - f * w;
     vn *= 1.0 - s * w;
+
+    // Adhesion pulls toward the surface, scaled to the velocity gravity adds
+    // in one substep (see ADHESION_GAIN).
+    if (a > VECTOR_EPSILON && gmag > VECTOR_EPSILON) {
+      vn -= ADHESION_GAIN * a * w * gmag * dt;
+    }
+
     pvel[idx] = ov + vt + n * vn;
   }
   inline BasicParticleSystem &getArg0()
@@ -1857,11 +1882,26 @@ struct knApplyObstacleStickiness : public KernelBase {
     return fricGuide;
   }
   typedef Grid<Real> type6;
-  inline const Real &getArg7()
+  inline const Grid<Real> &getArg7()
+  {
+    return adhGuide;
+  }
+  typedef Grid<Real> type7;
+  inline const Real &getArg8()
   {
     return band;
   }
-  typedef Real type7;
+  typedef Real type8;
+  inline const Real &getArg9()
+  {
+    return dt;
+  }
+  typedef Real type9;
+  inline const Real &getArg10()
+  {
+    return gmag;
+  }
+  typedef Real type10;
   void runMessage()
   {
     debMsg("Executing kernel knApplyObstacleStickiness ", 3);
@@ -1872,7 +1912,7 @@ struct knApplyObstacleStickiness : public KernelBase {
   void operator()(const tbb::blocked_range<IndexInt> &__r) const
   {
     for (IndexInt idx = __r.begin(); idx != (IndexInt)__r.end(); idx++)
-      op(idx, parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, band);
+      op(idx, parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, adhGuide, band, dt, gmag);
   }
   void run()
   {
@@ -1885,23 +1925,68 @@ struct knApplyObstacleStickiness : public KernelBase {
   const MACGrid &obvel;
   const Grid<Real> &stickGuide;
   const Grid<Real> &fricGuide;
+  const Grid<Real> &adhGuide;
   const Real band;
+  const Real dt;
+  const Real gmag;
 };
-//! Apply per-object friction and stickiness to particles close to obstacle
-//! surfaces. stickGuide / fricGuide store per-cell object values (max blend
-//! for overlapping obstacles), band is the distance in cells within which
-//! particles are affected.
+//! Apply per-object friction, stickiness and adhesion to particles close to
+//! obstacle surfaces. stickGuide / fricGuide / adhGuide store per-cell object
+//! values (max blend for overlapping obstacles), band is the distance in cells
+//! within which particles are affected. dt and gmag (gravity magnitude in
+//! solver units) scale the adhesion pull.
 
 void applyObstacleStickiness(BasicParticleSystem &parts,
                              ParticleDataImpl<Vec3> &pvel,
                              const FlagGrid &flags,
                              const Grid<Real> &phiObs,
                              const MACGrid &obvel,
+                             MACGrid &vel,
                              const Grid<Real> &stickGuide,
                              const Grid<Real> &fricGuide,
-                             const Real band = 2.5)
+                             const Grid<Real> &adhGuide,
+                             const Real band = 2.5,
+                             const Real dt = 0.0,
+                             const Real gmag = 0.0)
 {
-  knApplyObstacleStickiness(parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, band);
+  knApplyObstacleStickiness(
+      parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, adhGuide, band, dt, gmag);
+
+  // Grid-side adhesion: also pull the velocity grid toward the obstacle, so
+  // that particle advection (which follows the grid field) is attracted to
+  // the surface. This runs after the last pressure projection of the step,
+  // so the pull survives until the next step's advection.
+  if (gmag > VECTOR_EPSILON) {
+    const Vec3i size = phiObs.getSize();
+    for (int k = 0; k < size.z; k++) {
+      for (int j = 0; j < size.y; j++) {
+        for (int i = 0; i < size.x; i++) {
+          if (flags.isObstacle(i, j, k)) {
+            continue;
+          }
+          const IndexInt idx = phiObs.index(i, j, k);
+          const Real a = adhGuide[idx];
+          if (a <= VECTOR_EPSILON) {
+            continue;
+          }
+          const Real phi = phiObs[idx];
+          if (phi >= band) {
+            continue;
+          }
+          Real w = 1.0 - phi / band;
+          w = (w < 0.) ? 0. : ((w > 1.) ? 1. : w);
+          Vec3 n = getGradient(phiObs, i, j, k);
+          if (normalize(n) < VECTOR_EPSILON) {
+            continue;
+          }
+          const Real pull = -ADHESION_GAIN * a * w * gmag * dt;
+          vel[idx].x += n.x * pull;
+          vel[idx].y += n.y * pull;
+          vel[idx].z += n.z * pull;
+        }
+      }
+    }
+  }
 }
 static PyObject *_W_22(PyObject *_self, PyObject *_linargs, PyObject *_kwds)
 {
@@ -1918,11 +2003,26 @@ static PyObject *_W_22(PyObject *_self, PyObject *_linargs, PyObject *_kwds)
       const FlagGrid &flags = *_args.getPtr<FlagGrid>("flags", 2, &_lock);
       const Grid<Real> &phiObs = *_args.getPtr<Grid<Real>>("phiObs", 3, &_lock);
       const MACGrid &obvel = *_args.getPtr<MACGrid>("obvel", 4, &_lock);
-      const Grid<Real> &stickGuide = *_args.getPtr<Grid<Real>>("stickGuide", 5, &_lock);
-      const Grid<Real> &fricGuide = *_args.getPtr<Grid<Real>>("fricGuide", 6, &_lock);
-      const Real band = _args.getOpt<Real>("band", 7, 2.5, &_lock);
+      MACGrid &vel = *_args.getPtr<MACGrid>("vel", 5, &_lock);
+      const Grid<Real> &stickGuide = *_args.getPtr<Grid<Real>>("stickGuide", 6, &_lock);
+      const Grid<Real> &fricGuide = *_args.getPtr<Grid<Real>>("fricGuide", 7, &_lock);
+      const Grid<Real> &adhGuide = *_args.getPtr<Grid<Real>>("adhGuide", 8, &_lock);
+      const Real band = _args.getOpt<Real>("band", 9, 2.5, &_lock);
+      const Real dt = _args.getOpt<Real>("dt", 10, 0., &_lock);
+      const Real gmag = _args.getOpt<Real>("gmag", 11, 0., &_lock);
       _retval = getPyNone();
-      applyObstacleStickiness(parts, pvel, flags, phiObs, obvel, stickGuide, fricGuide, band);
+      applyObstacleStickiness(parts,
+                              pvel,
+                              flags,
+                              phiObs,
+                              obvel,
+                              vel,
+                              stickGuide,
+                              fricGuide,
+                              adhGuide,
+                              band,
+                              dt,
+                              gmag);
       _args.check();
     }
     pbFinalizePlugin(parent, "applyObstacleStickiness", !noTiming);

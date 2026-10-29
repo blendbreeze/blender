@@ -867,13 +867,14 @@ struct FluidEffectorSettings {
   char _pad1[6] = {};
 
   /* Collision options. */
-  float stickiness = 0.0f; /* Amount of adhesion keeping liquid at this obstacle's surface. */
-  float friction = 0.0f;   /* Amount of tangential velocity damping at this obstacle's surface. */
+  float stickiness = 0.0f; /* Damps velocity separating from this obstacle's surface. */
+  float friction = 0.0f;   /* Damps tangential velocity at this obstacle's surface. */
+  float adhesion = 0.0f;   /* Pulls liquid toward this obstacle's surface. */
 
   /* Guiding options. */
   float vel_multi = 1.0f; /* Multiplier for object velocity. */
   eFluidEffector_GuideMode guide_mode = FLUID_EFFECTOR_GUIDE_OVERRIDE;
-  char _pad2[2] = {};
+  char _pad2[6] = {};
 };
 
 }  // namespace blender

@@ -292,6 +292,7 @@ mantaMsg('Allocating obstacle data')\n\
 numObs_s$ID$     = s$ID$.create(RealGrid, name='$NAME_NUMOBS$')\n\
 stickiness_s$ID$ = s$ID$.create(RealGrid, name='stickiness') # per-cell stickiness values from collision objects\n\
 friction_s$ID$   = s$ID$.create(RealGrid, name='friction') # per-cell friction values from collision objects\n\
+adhesion_s$ID$   = s$ID$.create(RealGrid, name='adhesion') # per-cell adhesion values from collision objects\n\
 phiObsSIn_s$ID$  = s$ID$.create(LevelsetGrid, name='$NAME_PHIOBSSIN$') # helper for static obstacle objects\n\
 phiObsIn_s$ID$   = s$ID$.create(LevelsetGrid, name='$NAME_PHIOBSIN$')\n\
 obvel_s$ID$      = s$ID$.create(MACGrid, name='$NAME_OBVEL$')\n\

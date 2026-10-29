@@ -336,9 +336,10 @@ def liquid_step_$ID$():\n\
     else:\n\
         flipVelocityUpdate(vel=vel_s$ID$, velOld=velOld_s$ID$, flags=flags_s$ID$, parts=pp_s$ID$, partVel=pVel_pp$ID$, flipRatio=flipRatio_s$ID$)\n\
     \n\
-    # Apply per-object stickiness / friction from collision objects to particle velocities\n\
+    # Apply per-object stickiness / friction / adhesion from collision objects to particle velocities\n\
     if using_obstacle_s$ID$:\n\
-        applyObstacleStickiness(parts=pp_s$ID$, pvel=pVel_pp$ID$, flags=flags_s$ID$, phiObs=phiObs_s$ID$, obvel=obvel_s$ID$, stickGuide=stickiness_s$ID$, fricGuide=friction_s$ID$, band=2.5)\n";
+        gmag_s$ID$ = math.sqrt(gravity_s$ID$.x**2 + gravity_s$ID$.y**2 + gravity_s$ID$.z**2)\n\
+        applyObstacleStickiness(parts=pp_s$ID$, pvel=pVel_pp$ID$, flags=flags_s$ID$, phiObs=phiObs_s$ID$, obvel=obvel_s$ID$, vel=vel_s$ID$, stickGuide=stickiness_s$ID$, fricGuide=friction_s$ID$, adhGuide=adhesion_s$ID$, band=2.5, dt=s$ID$.timestep, gmag=gmag_s$ID$)\n";
 
 const std::string liquid_step_mesh =
     "\n\
