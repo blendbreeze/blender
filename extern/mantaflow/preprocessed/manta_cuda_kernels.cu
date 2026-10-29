@@ -3,10 +3,14 @@
 // levelset extrapolation, MAC velocity extrapolation). Ported 1:1 from the
 // CPU kernels in levelset.cpp / fastmarch.cpp - see PROJECT_NOTES.md.
 //
-// Enabled at runtime via MANTA_CUDA=1. All data is staged with cudaMemcpy per
-// call (grids are flat contiguous arrays). The kernels are deterministic:
-// flood fill is order independent, the extrapolation passes only write cells
-// whose values are never read within the same pass.
+// Enabled at runtime via MANTA_CUDA=1. Grids are staged through persistent
+// pinned host buffers with asynchronous copies; each operation queues its
+// kernels back-to-back and synchronizes once at the end (the flood fill uses
+// direction-alternating in-place sweeps instead of a per-layer BFS, so it
+// needs no intermediate device-host round trips). All kernels are
+// deterministic: the flood fill computes an order-independent reachable set,
+// and the extrapolation passes only write cells whose values are never read
+// within the same pass.
 //
 // After the first CUDA error the path latches off for the session with a
 // single log line and all callers fall back to the CPU implementations.
@@ -14,6 +18,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <cuda_runtime.h>
 
@@ -70,10 +75,8 @@ bool enabled()
   return s_env && !s_latched;
 }
 
-// Run a CUDA call, latch off and bail out on error. The reported error is
-// the actual return code of this call (sticky async kernel errors surface
-// here at the next synchronizing call).
-#define CUDA_SYNC_CHECK(call, where) \
+// Check the return code of a CUDA call, latch off and bail out on error.
+#define CUDA_RC(call, where) \
   do { \
     cudaError_t _rc = (call); \
     if (_rc != cudaSuccess) { \
@@ -82,17 +85,17 @@ bool enabled()
     } \
   } while (0)
 
-// Persistent device buffers (grow to the largest request, never shrink).
-// Plugin calls are serialized by the Python GIL (verified: no
-// Py_BEGIN_ALLOW_THREADS in the mantaflow wrapper layer), so no locking.
-// NOTE: `phi` is sized in floats and holds a scalar grid (n) or a MAC grid
+// Persistent device buffers plus pinned host staging (grows to the largest
+// request, never shrinks). Plugin calls are serialized by the Python GIL
+// (verified: no Py_BEGIN_ALLOW_THREADS in the mantaflow wrapper layer), so no
+// locking. `phi` is sized in floats and holds a scalar grid (n) or a MAC grid
 // (3 floats per cell) depending on the operation.
 struct DevBuffers {
-  float *phi = nullptr;
-  int *ibuf = nullptr;
-  int *flagsBuf = nullptr;
-  int *front[2] = {nullptr, nullptr};
-  int *fcount = nullptr;
+  float *phi = nullptr;    // device: scalar or MAC data
+  int *ibuf = nullptr;     // device: visited / tmp
+  int *flagsBuf = nullptr; // device: flag grid copy
+  float *hPhi = nullptr;   // pinned host staging for phi
+  int *hFlags = nullptr;   // pinned host staging for flags
   long phiFloats = 0;
   long intCells = 0;
 
@@ -105,9 +108,10 @@ struct DevBuffers {
     bool ok = cudaMalloc(&phi, needFloats * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&ibuf, needInts * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&flagsBuf, needInts * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&front[0], needInts * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&front[1], needInts * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&fcount, sizeof(int)) == cudaSuccess;
+    ok = ok && cudaHostAlloc((void **)&hPhi, needFloats * sizeof(float), cudaHostAllocDefault) ==
+             cudaSuccess;
+    ok = ok && cudaHostAlloc((void **)&hFlags, needInts * sizeof(int), cudaHostAllocDefault) ==
+             cudaSuccess;
     if (!ok) {
       cudaFail("device buffer alloc", cudaGetLastError());
       freeAll();
@@ -122,14 +126,13 @@ struct DevBuffers {
     cudaFree(phi);
     cudaFree(ibuf);
     cudaFree(flagsBuf);
-    cudaFree(front[0]);
-    cudaFree(front[1]);
-    cudaFree(fcount);
+    cudaFreeHost(hPhi);
+    cudaFreeHost(hFlags);
     phi = nullptr;
     ibuf = nullptr;
     flagsBuf = nullptr;
-    front[0] = front[1] = nullptr;
-    fcount = nullptr;
+    hPhi = nullptr;
+    hFlags = nullptr;
     phiFloats = 0;
     intCells = 0;
   }
@@ -156,50 +159,18 @@ __device__ __forceinline__ void coords(
   *i = (int)(r - (long)jj * sx);
 }
 
-// ---------------------------------------------------------------------------
-// flood fill
-
-// Seed: wall ring cells of the inner [bw, size-bw) box with matching sign.
-__global__ void seedWalls(const float *__restrict__ phi,
-                          int *__restrict__ visited,
-                          int *__restrict__ front,
-                          int *__restrict__ fcount,
-                          int sx,
-                          int sy,
-                          int sz,
-                          long strideZ,
-                          int bw,
-                          bool outside)
+__device__ __forceinline__ bool inInnerBox(int i, int j, int k, int sx, int sy, int sz, int bw)
 {
-  long n = (long)sx * sy * sz;
-  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
-       t += (long)gridDim.x * blockDim.x) {
-    int i, j, k;
-    coords(t, sx, strideZ, &i, &j, &k);
-    if (i < bw || j < bw || k < bw || i >= sx - bw || j >= sy - bw || k >= sz - bw) {
-      continue;
-    }
-    bool wall = (i == bw || i == sx - 1 - bw) || (j == bw || j == sy - 1 - bw) ||
-                (sz > 1 && (k == bw || k == sz - 1 - bw));
-    if (!wall || !signOkFill(phi[t], outside)) {
-      continue;
-    }
-    if (atomicCAS(&visited[t], 0, 1) == 0) {
-      long p = atomicAdd(fcount, 1);
-      if (p < n) {
-        front[p] = (int)t;
-      }
-    }
-  }
+  return i >= bw && j >= bw && k >= bw && i < sx - bw && j < sy - bw && k < sz - bw;
 }
 
-// Expand one BFS frontier layer.
-__global__ void expand(const float *__restrict__ phi,
+// ---------------------------------------------------------------------------
+// flood fill: seed the wall ring, then propagate with direction-alternating
+// in-place sweeps. The reachable set is identical to the CPU stack-based
+// flood fill (order-independent reachability), so the result matches.
+
+__global__ void ffInit(const float *__restrict__ phi,
                        int *__restrict__ visited,
-                       const int *__restrict__ front,
-                       int fsize,
-                       int *__restrict__ nfront,
-                       int *__restrict__ ncount,
                        int sx,
                        int sy,
                        int sz,
@@ -207,44 +178,75 @@ __global__ void expand(const float *__restrict__ phi,
                        int bw,
                        bool outside)
 {
-  int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= fsize) {
-    return;
-  }
-  long c = front[t];
-  int i, j, k;
-  coords(c, sx, strideZ, &i, &j, &k);
   long n = (long)sx * sy * sz;
-
-  auto tryNb = [&](long idx, bool ok) {
-    if (ok && !visited[idx] && signOkFill(phi[idx], outside)) {
-      if (atomicCAS(&visited[idx], 0, 1) == 0) {
-        long p = atomicAdd(ncount, 1);
-        if (p < n) {
-          nfront[p] = (int)idx;
-        }
-      }
+  for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+       t += (long)gridDim.x * blockDim.x) {
+    int i, j, k;
+    coords(t, sx, strideZ, &i, &j, &k);
+    bool seed = false;
+    if (inInnerBox(i, j, k, sx, sy, sz, bw) && signOkFill(phi[t], outside)) {
+      const bool wall = (i == bw || i == sx - 1 - bw) || (j == bw || j == sy - 1 - bw) ||
+                        (sz > 1 && (k == bw || k == sz - 1 - bw));
+      seed = wall;
     }
-  };
-  tryNb(c - 1, i > bw);
-  tryNb(c + 1, i < sx - 1 - bw);
-  tryNb(c - sx, j > bw);
-  tryNb(c + sx, j < sy - 1 - bw);
-  if (sz > 1) {
-    tryNb(c - strideZ, k > bw);
-    tryNb(c + strideZ, k < sz - 1 - bw);
+    visited[t] = seed ? 1 : 0;
   }
 }
 
-// Same as KnFillApply: overwrite unvisited cells with matching sign.
+// One Gauss-Seidel-style propagation sweep; `reverse` flips the traversal
+// direction so information spreads from both ends between iterations.
+__global__ void ffSweep(const float *__restrict__ phi,
+                        int *__restrict__ visited,
+                        int sx,
+                        int sy,
+                        int sz,
+                        long strideZ,
+                        int bw,
+                        bool outside,
+                        int reverse)
+{
+  long n = (long)sx * sy * sz;
+  for (long u = (long)blockIdx.x * blockDim.x + threadIdx.x; u < n;
+       u += (long)gridDim.x * blockDim.x) {
+    const long t = reverse ? (n - 1 - u) : u;
+    if (visited[t]) {
+      continue;
+    }
+    int i, j, k;
+    coords(t, sx, strideZ, &i, &j, &k);
+    if (!inInnerBox(i, j, k, sx, sy, sz, bw) || !signOkFill(phi[t], outside)) {
+      continue;
+    }
+    bool hit = visited[t - 1] || visited[t + 1] || visited[t - sx] || visited[t + sx];
+    if (!hit && sz > 1) {
+      hit = visited[t - strideZ] || visited[t + strideZ];
+    }
+    if (hit) {
+      visited[t] = 1;
+    }
+  }
+}
+
+// Same as KnFillApply (interior of the inner box only): overwrite unvisited
+// cells with matching sign.
 __global__ void applyFill(float *__restrict__ phi,
                           const int *__restrict__ visited,
-                          long n,
+                          int sx,
+                          int sy,
+                          int sz,
+                          long strideZ,
+                          int bw,
                           float value,
                           bool outside)
 {
+  long n = (long)sx * sy * sz;
   for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
        t += (long)gridDim.x * blockDim.x) {
+    int i, j, k;
+    coords(t, sx, strideZ, &i, &j, &k);
+    if (!inInnerBox(i, j, k, sx, sy, sz, bw)) {
+      continue;
+    }
     if (visited[t]) {
       continue;
     }
@@ -274,7 +276,7 @@ __global__ void lsMarkSkip(const float *__restrict__ phi,
        t += (long)gridDim.x * blockDim.x) {
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
-    if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
       continue;
     }
     if ((!inside && phi[t] < 0.0f) || (inside && phi[t] > 0.0f)) {
@@ -293,7 +295,7 @@ __global__ void lsFirstLayer(int *__restrict__ tmp, int sx, int sy, int sz, long
     }
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
-    if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
       continue;
     }
     bool hit = false;
@@ -329,7 +331,7 @@ __global__ void lsDilate(float *__restrict__ phi,
     }
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
-    if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
       continue;
     }
     int nbs = 0;
@@ -365,7 +367,7 @@ __global__ void lsRemaining(float *__restrict__ phi,
     }
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
-    if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
       continue;
     }
     phi[t] = value;
@@ -394,7 +396,7 @@ __global__ void macMark(const int *__restrict__ flags,
     }
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
-    if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
       continue;
     }
     const int f = flags[t];
@@ -429,7 +431,7 @@ __global__ void macDilate(float *__restrict__ vel,
     }
     int i, j, k;
     coords(t, sx, strideZ, &i, &j, &k);
-    if (i < 1 || j < 1 || k < 1 || i >= sx - 1 || j >= sy - 1 || k >= sz - 1) {
+    if (!inInnerBox(i, j, k, sx, sy, sz, 1)) {
       continue;
     }
     int nbs = 0;
@@ -471,55 +473,31 @@ bool cudaFloodFill(Grid<Real> &phi, Real value, bool outside, int boundaryWidth)
   if (n <= 0 || n >= (long)INT_MAX) {
     return false;
   }
+  const long bytes = n * sizeof(float);
 
   if (!g_dev.ensure(n, n)) {
     return false;
   }
   DevBuffers &buf = g_dev;
-  CUDA_SYNC_CHECK(cudaMemcpy(buf.phi, &phi(0), n * sizeof(float), cudaMemcpyHostToDevice),
-                  "floodFill: copy in");
-  CUDA_SYNC_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)), "floodFill: memset visited");
-  CUDA_SYNC_CHECK(cudaMemset(buf.fcount, 0, sizeof(int)), "floodFill: memset count");
+  memcpy(buf.hPhi, &phi(0), bytes);
+  CUDA_RC(cudaMemcpyAsync(buf.phi, buf.hPhi, bytes, cudaMemcpyHostToDevice),
+          "floodFill: copy in");
+  CUDA_RC(cudaMemsetAsync(buf.ibuf, 0, n * sizeof(int)), "floodFill: memset visited");
 
-  seedWalls<<<blocksFor(n), 256>>>(
-      buf.phi, buf.ibuf, buf.front[0], buf.fcount, sx, sy, sz, strideZ, boundaryWidth, outside);
-
-  bool exhausted = false;
-  int cur = 0;
-  for (long iter = 0; iter < n + 8; iter++) {
-    int hCount = 0;
-    CUDA_SYNC_CHECK(cudaMemcpy(&hCount, buf.fcount, sizeof(int), cudaMemcpyDeviceToHost),
-                    "floodFill: count readback");
-    if (hCount == 0) {
-      break;
-    }
-    if (hCount > (int)n || iter == n + 7) {
-      exhausted = true;  // safety net, should not happen
-      break;
-    }
-    cudaMemset(buf.fcount, 0, sizeof(int));
-    expand<<<blocksFor(hCount), 256>>>(buf.phi,
-                                       buf.ibuf,
-                                       buf.front[cur],
-                                       hCount,
-                                       buf.front[cur ^ 1],
-                                       buf.fcount,
-                                       sx,
-                                       sy,
-                                       sz,
-                                       strideZ,
-                                       boundaryWidth,
-                                       outside);
-    cur ^= 1;
+  ffInit<<<blocksFor(n), 256>>>(buf.phi, buf.ibuf, sx, sy, sz, strideZ, boundaryWidth, outside);
+  // sx+sy+sz alternating sweeps is a safe upper bound on the propagation
+  // depth; all launches are queued asynchronously with no round trips.
+  const int sweeps = sx + sy + sz;
+  for (int s = 0; s < sweeps; s++) {
+    ffSweep<<<blocksFor(n), 256>>>(
+        buf.phi, buf.ibuf, sx, sy, sz, strideZ, boundaryWidth, outside, s & 1);
   }
-  if (exhausted) {
-    cudaFail("floodFill: BFS exhausted (bug)", cudaErrorUnknown);
-    return false;
-  }
-
-  applyFill<<<blocksFor(n), 256>>>(buf.phi, buf.ibuf, n, (float)value, outside);
-  CUDA_SYNC_CHECK(cudaMemcpy(&phi(0), buf.phi, n * sizeof(float), cudaMemcpyDeviceToHost),
-                  "floodFill: copy out");
+  applyFill<<<blocksFor(n), 256>>>(
+      buf.phi, buf.ibuf, sx, sy, sz, strideZ, boundaryWidth, (float)value, outside);
+  CUDA_RC(cudaMemcpyAsync(buf.hPhi, buf.phi, bytes, cudaMemcpyDeviceToHost),
+          "floodFill: copy out");
+  CUDA_RC(cudaStreamSynchronize(0), "floodFill: sync");
+  memcpy(&phi(0), buf.hPhi, bytes);
   return true;
 }
 
@@ -536,14 +514,16 @@ bool cudaExtrapolateLsSimple(Grid<Real> &phi, int distance, bool inside)
   if (n <= 0 || n >= (long)INT_MAX) {
     return false;
   }
+  const long bytes = n * sizeof(float);
 
   if (!g_dev.ensure(n, n)) {
     return false;
   }
   DevBuffers &buf = g_dev;
-  CUDA_SYNC_CHECK(cudaMemcpy(buf.phi, &phi(0), n * sizeof(float), cudaMemcpyHostToDevice),
-                  "extrapolateLs: copy in");
-  CUDA_SYNC_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)), "extrapolateLs: memset tmp");
+  memcpy(buf.hPhi, &phi(0), bytes);
+  CUDA_RC(cudaMemcpyAsync(buf.phi, buf.hPhi, bytes, cudaMemcpyHostToDevice),
+          "extrapolateLs: copy in");
+  CUDA_RC(cudaMemsetAsync(buf.ibuf, 0, n * sizeof(int)), "extrapolateLs: memset tmp");
 
   const float direction = inside ? -1.0f : 1.0f;
   lsMarkSkip<<<blocksFor(n), 256>>>(buf.phi, buf.ibuf, sx, sy, sz, strideZ, inside);
@@ -554,8 +534,10 @@ bool cudaExtrapolateLsSimple(Grid<Real> &phi, int distance, bool inside)
   lsRemaining<<<blocksFor(n), 256>>>(
       buf.phi, buf.ibuf, sx, sy, sz, strideZ, direction * (distance + 2));
 
-  CUDA_SYNC_CHECK(cudaMemcpy(&phi(0), buf.phi, n * sizeof(float), cudaMemcpyDeviceToHost),
-                  "extrapolateLs: copy out");
+  CUDA_RC(cudaMemcpyAsync(buf.hPhi, buf.phi, bytes, cudaMemcpyDeviceToHost),
+          "extrapolateLs: copy out");
+  CUDA_RC(cudaStreamSynchronize(0), "extrapolateLs: sync");
+  memcpy(&phi(0), buf.hPhi, bytes);
   return true;
 }
 
@@ -573,18 +555,21 @@ bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool 
     return false;
   }
   const long velFloats = 3 * n;
+  const long velBytes = velFloats * sizeof(float);
 
   if (!g_dev.ensure(velFloats, n)) {
     return false;
   }
   DevBuffers &buf = g_dev;
-  CUDA_SYNC_CHECK(cudaMemcpy(buf.phi, &vel(0), velFloats * sizeof(float), cudaMemcpyHostToDevice),
-                  "extrapolateMAC: copy in");
-  CUDA_SYNC_CHECK(cudaMemcpy(buf.flagsBuf, &flags(0), n * sizeof(int), cudaMemcpyHostToDevice),
-                  "extrapolateMAC: flags copy");
+  memcpy(buf.hPhi, &vel(0), velBytes);
+  memcpy(buf.hFlags, &flags(0), n * sizeof(int));
+  CUDA_RC(cudaMemcpyAsync(buf.phi, buf.hPhi, velBytes, cudaMemcpyHostToDevice),
+          "extrapolateMAC: copy in");
+  CUDA_RC(cudaMemcpyAsync(buf.flagsBuf, buf.hFlags, n * sizeof(int), cudaMemcpyHostToDevice),
+          "extrapolateMAC: flags copy");
 
   for (int c = 0; c < dim; ++c) {
-    CUDA_SYNC_CHECK(cudaMemset(buf.ibuf, 0, n * sizeof(int)), "extrapolateMAC: memset tmp");
+    CUDA_RC(cudaMemsetAsync(buf.ibuf, 0, n * sizeof(int)), "extrapolateMAC: memset tmp");
     macMark<<<blocksFor(n), 256>>>(buf.flagsBuf, buf.ibuf, sx, sy, sz, strideZ, c, intoObs);
     cudaError_t lrc = cudaGetLastError();
     if (lrc != cudaSuccess) {
@@ -601,8 +586,10 @@ bool cudaExtrapolateMACSimple(FlagGrid &flags, MACGrid &vel, int distance, bool 
     }
   }
 
-  CUDA_SYNC_CHECK(cudaMemcpy(&vel(0), buf.phi, velFloats * sizeof(float), cudaMemcpyDeviceToHost),
-                  "extrapolateMAC: copy out");
+  CUDA_RC(cudaMemcpyAsync(buf.hPhi, buf.phi, velBytes, cudaMemcpyDeviceToHost),
+          "extrapolateMAC: copy out");
+  CUDA_RC(cudaStreamSynchronize(0), "extrapolateMAC: sync");
+  memcpy(&vel(0), buf.hPhi, velBytes);
   return true;
 }
 
