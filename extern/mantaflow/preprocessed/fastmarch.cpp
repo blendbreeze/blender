@@ -815,6 +815,11 @@ struct knExtrapolateMACFromWeight : public KernelBase {
 
 void extrapolateMACFromWeight(MACGrid &vel, Grid<Vec3> &weight, int distance = 2)
 {
+  if (manta_cuda::enabled() && vel.is3D()) {
+    if (cudaExtrapolateMACFromWeight(vel, weight, distance)) {
+      return;
+    }
+  }
   const int dim = (vel.is3D() ? 3 : 2);
 
   for (int c = 0; c < dim; ++c) {
@@ -1233,6 +1238,11 @@ void PbRegister_extrapolateLsSimple()
 
 void extrapolateVec3Simple(Grid<Vec3> &vel, Grid<Real> &phi, int distance = 4, bool inside = false)
 {
+  if (manta_cuda::enabled() && vel.is3D()) {
+    if (cudaExtrapolateVec3Simple(vel, phi, distance, inside)) {
+      return;
+    }
+  }
   Grid<int> tmp(vel.getParent());
   tmp.clear();
   const int dim = (vel.is3D() ? 3 : 2);

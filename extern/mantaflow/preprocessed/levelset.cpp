@@ -968,6 +968,28 @@ void LevelsetGrid::createMesh(Mesh &mesh)
 {
   assertMsg(is3D(), "Only 3D grids supported so far");
 
+  if (manta_cuda::enabled()) {
+    std::vector<float> verts, normals;
+    std::vector<int> tris;
+    if (cudaMarchingCubes(*this, verts, normals, tris)) {
+      mesh.clear();
+      const long numVerts = (long)verts.size() / 3;
+      for (long v = 0; v < numVerts; v++) {
+        Node vertex;
+        vertex.pos = Vec3(verts[3 * v], verts[3 * v + 1], verts[3 * v + 2]);
+        vertex.normal = Vec3(normals[3 * v], normals[3 * v + 1], normals[3 * v + 2]);
+        mesh.addNode(vertex);
+      }
+      const long numTris = (long)tris.size() / 3;
+      for (long q = 0; q < numTris; q++) {
+        mesh.addTri(Triangle(tris[3 * q], tris[3 * q + 1], tris[3 * q + 2]));
+      }
+      // Update mdata fields
+      mesh.updateDataFields();
+      return;
+    }
+  }
+
   mesh.clear();
 
   const Real invalidTime = invalidTimeValue();

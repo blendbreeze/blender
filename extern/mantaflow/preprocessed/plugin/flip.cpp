@@ -25,9 +25,14 @@
 #include "levelset.h"
 #include "shapes.h"
 #include "matrixbase.h"
+#include "manta_cuda.h"
 
 using namespace std;
 namespace Manta {
+
+// The CUDA particle levelset port reinterprets the particle array as float4.
+static_assert(sizeof(BasicParticleData) == 16, "unexpected BasicParticleData layout");
+static_assert(sizeof(Vec3) == 3 * sizeof(Real), "unexpected Vec3 layout");
 
 // init
 
@@ -931,6 +936,16 @@ void unionParticleLevelset(const BasicParticleSystem &parts,
                            const ParticleDataImpl<int> *ptype = nullptr,
                            const int exclude = 0)
 {
+  if (manta_cuda::enabled() && !ptype && flags.is3D()) {
+    // The CUDA path builds its own particle index; the CPU indexSys built by
+    // the preceding gridParticleIndex call is left untouched for other users.
+    if (cudaUnionParticleLevelset(parts.size() ? &parts[0] : nullptr,
+                                  (long)parts.size(),
+                                  phi,
+                                  radiusFactor)) {
+      return;
+    }
+  }
   // use half a cell diagonal as base radius
   const Real radius = 0.5 * calculateRadiusFactor(phi, radiusFactor);
   // no reset of phi necessary here
@@ -1519,6 +1534,20 @@ void improvedParticleLevelset(const BasicParticleSystem &parts,
                               const ParticleDataImpl<int> *ptype = nullptr,
                               const int exclude = 0)
 {
+  if (manta_cuda::enabled() && !ptype && flags.is3D()) {
+    // The CUDA path builds its own particle index; the CPU indexSys built by
+    // the preceding gridParticleIndex call is left untouched for other users.
+    if (cudaImprovedParticleLevelset(parts.size() ? &parts[0] : nullptr,
+                                     (long)parts.size(),
+                                     phi,
+                                     radiusFactor,
+                                     smoothen,
+                                     smoothenNeg,
+                                     t_low,
+                                     t_high)) {
+      return;
+    }
+  }
   // create temporary grids to store values from levelset weight computation
   Grid<Vec3> save_pAcc(flags.getParent());
   Grid<Real> save_rAcc(flags.getParent());
@@ -2205,6 +2234,17 @@ void mapPartsToMAC(const FlagGrid &flags,
                    const ParticleDataImpl<int> *ptype = nullptr,
                    const int exclude = 0)
 {
+  if (manta_cuda::enabled() && weight && !ptype && flags.is3D() &&
+      sizeof(BasicParticleData) == 16) {
+    if (cudaMapPartsToMAC(parts.size() ? &parts[0] : nullptr,
+                          (long)parts.size(),
+                          parts.size() ? (const float *)&partVel[0] : nullptr,
+                          const_cast<MACGrid &>(vel),
+                          *weight)) {
+      velOld.copyFrom(vel);  // store original state, as the CPU path does
+      return;
+    }
+  }
   // interpol -> grid. tmpgrid for particle contribution weights
   bool freeTmp = false;
   if (!weight) {
@@ -2813,6 +2853,17 @@ void flipVelocityUpdate(const FlagGrid &flags,
                         const ParticleDataImpl<int> *ptype = nullptr,
                         const int exclude = 0)
 {
+  if (manta_cuda::enabled() && !ptype && flags.is3D() && parts.size() > 0 &&
+      sizeof(BasicParticleData) == 16) {
+    if (cudaFlipVelocityUpdate(&parts[0],
+                               (long)parts.size(),
+                               (float *)&partVel[0],
+                               const_cast<MACGrid &>(vel),
+                               const_cast<MACGrid &>(velOld),
+                               flipRatio)) {
+      return;
+    }
+  }
   knMapLinearMACGridToVec3_FLIP(parts, flags, vel, velOld, partVel, flipRatio, ptype, exclude);
 }
 static PyObject *_W_18(PyObject *_self, PyObject *_linargs, PyObject *_kwds)
