@@ -1238,11 +1238,9 @@ void PbRegister_extrapolateLsSimple()
 
 void extrapolateVec3Simple(Grid<Vec3> &vel, Grid<Real> &phi, int distance = 4, bool inside = false)
 {
-  if (manta_cuda::enabled() && vel.is3D()) {
-    if (cudaExtrapolateVec3Simple(vel, phi, distance, inside)) {
-      return;
-    }
-  }
+  // NOTE: a GPU port of this op exists (cudaExtrapolateVec3Simple) but is a
+  // net loss per profile (CPU TBB ~1.2s vs GPU round trips ~2.2s per 60-frame
+  // bake). Revisit with device-resident grids.
   Grid<int> tmp(vel.getParent());
   tmp.clear();
   const int dim = (vel.is3D() ? 3 : 2);

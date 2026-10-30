@@ -2850,20 +2850,12 @@ void flipVelocityUpdate(const FlagGrid &flags,
                         const BasicParticleSystem &parts,
                         ParticleDataImpl<Vec3> &partVel,
                         const Real flipRatio,
-                        const ParticleDataImpl<int> *ptype = nullptr,
-                        const int exclude = 0)
+                              const ParticleDataImpl<int> *ptype = nullptr,
+                              const int exclude = 0)
 {
-  if (manta_cuda::enabled() && !ptype && flags.is3D() && parts.size() > 0 &&
-      sizeof(BasicParticleData) == 16) {
-    if (cudaFlipVelocityUpdate(&parts[0],
-                               (long)parts.size(),
-                               (float *)&partVel[0],
-                               const_cast<MACGrid &>(vel),
-                               const_cast<MACGrid &>(velOld),
-                               flipRatio)) {
-      return;
-    }
-  }
+  // NOTE: a GPU port of this op exists (cudaFlipVelocityUpdate) but is a net
+  // loss per profile: the CPU TBB gather costs ~0.04s per 60-frame bake while
+  // the full-grid uploads cost ~1.3s. Revisit with device-resident grids.
   knMapLinearMACGridToVec3_FLIP(parts, flags, vel, velOld, partVel, flipRatio, ptype, exclude);
 }
 static PyObject *_W_18(PyObject *_self, PyObject *_linargs, PyObject *_kwds)

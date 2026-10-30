@@ -1870,7 +1870,7 @@ __device__ __forceinline__ float3 macInterp(const float *__restrict__ data,
 
 // setInterpolMAC as atomic scatter: velocity weight into both vel and wgt
 // (3 floats per cell each), same 8 corners per component as the CPU version.
-__device__ __forceinline__ void macScatterAtomic(const float *__restrict__ parts,
+__device__ __forceinline__ void macScatterAtomic(const float4 *__restrict__ parts,
                                                  const float *__restrict__ pvel,
                                                  float *__restrict__ vel,
                                                  float *__restrict__ wgt,
